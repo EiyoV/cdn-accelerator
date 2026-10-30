@@ -34,11 +34,21 @@ $script = Join-Path $dir 'cdn-accelerator.py'
 $backup = Join-Path $dir 'dns-backup.txt'
 $schtasks = "$env:SystemRoot\System32\schtasks.exe"
 
-# 2. backup current IPv4 + IPv6 DNS per adapter
+# 2. backup current IPv4 + IPv6 DNS per adapter.
+#    ONLY real, active adapters: virtual NICs (WARP/本地连接*, Bluetooth,
+#    Loopback, Hyper-V, WAN miniport) must never be taken over - they have
+#    no active route, and netsh cannot reliably restore their DNS later,
+#    leaving stale ::1 entries after uninstall.
+$realIdx = @(Get-NetAdapter -ErrorAction SilentlyContinue |
+    Where-Object {
+        $_.Status -eq 'Up' -and
+        $_.InterfaceDescription -notmatch 'Virtual|TAP|Wintun|Bluetooth|Loopback|Hyper-V|WAN Miniport|VirtualBox|VMware'
+    } |
+    Select-Object -ExpandProperty ifIndex)
 $adapters = Get-DnsClientServerAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
-    Where-Object { $_.ServerAddresses.Count -gt 0 -and $_.ServerAddresses -notcontains '127.0.0.1' }
+    Where-Object { $_.InterfaceIndex -in $realIdx -and $_.ServerAddresses.Count -gt 0 -and $_.ServerAddresses -notcontains '127.0.0.1' }
 $adapters6 = Get-DnsClientServerAddress -AddressFamily IPv6 -ErrorAction SilentlyContinue |
-    Where-Object { $_.ServerAddresses.Count -gt 0 -and $_.ServerAddresses -notcontains '::1' }
+    Where-Object { $_.InterfaceIndex -in $realIdx -and $_.ServerAddresses.Count -gt 0 -and $_.ServerAddresses -notcontains '::1' }
 if ($adapters.Count -eq 0 -and $adapters6.Count -eq 0) { Write-Host "No upstream DNS found to change; nothing to do."; exit 0 }
 if ($adapters.Count -gt 0) {
     $lines = @()
@@ -64,9 +74,15 @@ foreach ($a in $adapters6) {
 }
 Write-Host "System DNS -> 127.0.0.1 / ::1"
 
-# 4. on-logon scheduled task
-$upstreams = ($adapters | ForEach-Object { $_.ServerAddresses } | Where-Object { $_ -ne '127.0.0.1' } | Select-Object -Unique | Select-Object -First 2) -join ','
-if (-not $upstreams) { $upstreams = '223.5.5.5' }
+# 4. on-logon scheduled task.
+#    Upstream list = original router DNS + public DNS fallbacks (IPv4 only).
+#    Single-source lookups were the hidden latency: the router DNS answered
+#    some CDN names only after a ~1.2s timeout, and the query worker waited
+#    synchronously -> every affected page felt slow. With 2+ parallel sources
+#    the first responder wins (typical 10-60ms).
+$orig = ($adapters | ForEach-Object { $_.ServerAddresses } | Where-Object { $_ -ne '127.0.0.1' -and $_ -notmatch ':' } | Select-Object -Unique | Select-Object -First 2)
+$upstreams = (@($orig) + @('223.5.5.5', '119.29.29.29')) | Select-Object -Unique | Select-Object -First 3 | Join-String -Separator ','
+if (-not $upstreams) { $upstreams = '223.5.5.5,119.29.29.29' }
 & $schtasks /Create /TN "cdn_accelerator" /TR "`"$pywExe`" -u `"$script`" --upstream $upstreams" /SC ONLOGON /F | Out-Null
 Write-Host "Scheduled task created (on logon), upstream=$upstreams"
 

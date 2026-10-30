@@ -53,7 +53,11 @@ if (Test-Path -LiteralPath $backup6) {
                 try {
                     & $netsh interface ipv6 set dns "$alias" static $servers[0] | Out-Null
                     Write-Host "Restored IPv6 DNS on interface $idx : $($servers[0])"
-                } catch { Write-Host "WARN: could not restore IPv6 interface $idx : $_" }
+                } catch {
+                    # restore via DHCP as fallback - never leave a stale ::1 behind
+                    try { & $netsh interface ipv6 delete dns "$alias" all | Out-Null } catch { }
+                    Write-Host "WARN: could not restore IPv6 interface $idx, reset to DHCP : $_"
+                }
             }
         }
     }
@@ -69,6 +73,17 @@ if (Test-Path -LiteralPath $backup6) {
     } catch { Write-Host "WARN: could not reset IPv6 DNS : $_" }
 }
 
-# 4. flush
+# 4. sweep any stale ::1 left on non-loopback adapters (belt & braces:
+#    virtual NICs from older installs may hold a dead ::1)
+$stale = Get-DnsClientServerAddress -AddressFamily IPv6 -ErrorAction SilentlyContinue |
+    Where-Object { $_.ServerAddresses -contains '::1' -and $_.InterfaceAlias -notmatch 'Loopback' }
+foreach ($a in $stale) {
+    try {
+        & $netsh interface ipv6 delete dns "$($a.InterfaceAlias)" all | Out-Null
+        Write-Host "Swept stale IPv6 DNS on $($a.InterfaceAlias)"
+    } catch { Write-Host "WARN: could not sweep $($a.InterfaceAlias) : $_" }
+}
+
+# 5. flush
 & "$env:SystemRoot\System32\ipconfig.exe" /flushdns | Out-Null
 Write-Host "Done. DNS flushed."

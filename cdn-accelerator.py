@@ -44,10 +44,19 @@ LOG_MAX_BYTES = 1024 * 1024          # 1 MB, then rotate (truncate)
 REFRESH_INTERVAL = 300               # seconds between full CF pool re-measure
 HEALTH_INTERVAL = 8                   # seconds between health re-probes of live nodes
 TCP_TIMEOUT = 4.0                     # seconds per probe (hard total budget; SSL ctx is cached so this is a true budget). 4s: a "slow-but-live" edge (github TTFB ~3s during degraded international windows) must count as live - a 1.5s budget killed the ONLY reachable GitHub edge and fail-open then handed out a truly dead raw IP (the exact "GitHub down = accelerator's fault" case). Fast edges return on first success, so this only delays all-dead/slow rounds - being able to open beats being fast to fail.
+TCP_CONNECT_TIMEOUT = 2.0             # separate SHORT budget for the TCP connect phase only. v2.17: when a
+                                      # whole segment is dead most candidates fail at connect; failing them in
+                                      # 2.0s instead of 4.0s halves worker blocking. A 4s-every-probe flood
+                                      # starved the 32-worker pool and took Bilibili/Doubao (passthrough,
+                                      # same pool) offline with it - the "suddenly everything is down" bug.
 CACHE_TTL = 60                         # answer cache validity (queries hit cache -> instant; liveness is kept fresh by health_worker)
 ANSWER_TTL = 15                        # TTL handed to the client (browser re-asks after 15s; health cycle is 8s)
 MAX_CACHE = 2000                     # hard cap for domain cache entries
-MAX_WORKERS = 32                     # concurrent query handlers per socket
+MAX_WORKERS = 64                     # concurrent query handlers per socket (2 sockets -> 128 max).
+                                     # v2.17: raised from 32. An all-dead probe round holds a worker
+                                     # for ~2s now (TCP fast-fail); with 32 workers a browser burst
+                                     # (Bilibili + Doubao + game pages = dozens of names) could still
+                                     # exhaust the pool and starve even passthrough queries.
 CF_POOL = [
     "104.16.0.1", "104.16.1.1", "104.16.16.1", "104.16.32.1", "104.16.64.1",
     "104.16.96.1", "104.16.128.1", "104.16.132.229", "104.16.160.1", "104.16.192.82",
@@ -403,13 +412,14 @@ def resolve_upstream_all(qname, qtype):
 
     def _collect(up):
         for attempt in range(2):
-            resp = forward_raw(query, up, timeout=1.2)
+            resp = forward_raw(query, up, timeout=0.8)
             if resp:
                 return extract_a_records(resp)
         return []
 
-    with ThreadPoolExecutor(max_workers=max(1, len(UPSTREAMS))) as ex:
-        futs = {ex.submit(_collect, up): up for up in UPSTREAMS}
+    ex = ThreadPoolExecutor(max_workers=max(1, len(UPSTREAMS)))
+    futs = {ex.submit(_collect, up): up for up in UPSTREAMS}
+    try:
         for f in as_completed(futs):
             try:
                 answers = f.result()
@@ -417,7 +427,16 @@ def resolve_upstream_all(qname, qtype):
                 continue
             if answers:
                 return answers
-    return []
+        return []
+    finally:
+        # Critical: NEVER block the query worker on slow resolvers. `with
+        # ThreadPoolExecutor` would shutdown(wait=True) and wait for every
+        # straggler (a dead router DNS retries 2x0.8s), turning a 0.8s
+        # first-answer into a 1.6s+ lookup - exactly the latency that made
+        # pages feel dead. Cancel outstanding and return now.
+        for f in futs:
+            f.cancel()
+        ex.shutdown(wait=False)
 
 
 PUBLIC_DNS = ["223.5.5.5", "119.29.29.29", "114.114.114.114"]
@@ -437,8 +456,9 @@ def resolve_multi_source(qname, qtype):
             return []
         return extract_a_records(resp)
 
-    with ThreadPoolExecutor(max_workers=len(sources)) as ex:
-        futs = {ex.submit(_collect, srv): srv for srv in sources}
+    ex = ThreadPoolExecutor(max_workers=len(sources))
+    futs = {ex.submit(_collect, srv): srv for srv in sources}
+    try:
         for f in as_completed(futs):
             try:
                 answers = f.result()
@@ -446,7 +466,12 @@ def resolve_multi_source(qname, qtype):
                 continue
             if answers:
                 return [(ip, 60) for ip, _ in answers if ":" not in ip]
-    return []
+        return []
+    finally:
+        # never block the query worker on slow resolvers (see resolve_upstream_all)
+        for f in futs:
+            f.cancel()
+        ex.shutdown(wait=False)
 
 
 def make_query(qname, qtype):
@@ -521,6 +546,19 @@ def extract_a_records(resp):
 _SSL_CTX = None
 _SSL_LOCK = threading.Lock()
 
+# Windows system stores here expose only ~35 roots, so a live GitHub/Azure
+# edge fails validation ("unable to get issuer certificate") and gets
+# misjudged dead -> ALLDEAD -> fail-open hands out a truly dead raw IP
+# (GitHub "down" that is really a CA bug). Load a full CA bundle on top:
+# prefer the one bundled with the app, fall back to common install paths.
+_CA_CANDIDATES = [
+    os.path.join(_HERE, "cacert.pem"),
+    r"C:\Program Files\Git\mingw64\etc\ssl\cert.pem",
+    r"C:\Program Files\Git\usr\ssl\cert.pem",
+    r"C:\Program Files\Python312\Lib\site-packages\certifi\cacert.pem",
+    r"C:\Python312\Lib\site-packages\certifi\cacert.pem",
+]
+
 def _get_ssl_ctx():
     global _SSL_CTX
     with _SSL_LOCK:
@@ -528,6 +566,14 @@ def _get_ssl_ctx():
             c = ssl.create_default_context()
             c.check_hostname = True
             c.verify_mode = ssl.CERT_REQUIRED
+            for _ca in _CA_CANDIDATES:
+                try:
+                    if os.path.isfile(_ca):
+                        c.load_verify_locations(_ca)
+                        log.info("SSL: loaded extra CA bundle: %s" % _ca)
+                        break
+                except Exception:
+                    continue
             _SSL_CTX = c
     return _SSL_CTX
 
@@ -560,14 +606,21 @@ def probe_conn(ip, host=None, port=443, timeout=TCP_TIMEOUT):
             pass
 
 
-def probe_http(ip, host, port=443, timeout=TCP_TIMEOUT):
+def probe_http(ip, host, port=443, timeout=TCP_TIMEOUT, tcp_timeout=TCP_CONNECT_TIMEOUT):
     """TCP + TLS(fully verified, needs bundled/system CA) + real HTTP HEAD.
     A node is healthy only if it answers HTTP 2xx/3xx AND its certificate
     validates for `host`. Filters cross-tenant CDN nodes whose handshake
     works but whose cert belongs to another site (privacy errors).
-    `timeout` is a HARD total budget: settimeout() alone is per-operation,
-    so connect+TLS+recv could otherwise each take `timeout` (4.5s worst
-    case per node when all candidates are dead)."""
+    `timeout` is the HARD total budget for TLS+HTTP (kept at 4.0s so a
+    slow-but-live edge with TTFB ~3s still counts as live); `tcp_timeout`
+    is a SEPARATE short budget for the TCP connect phase (2.0s). Two-phase
+    budgets matter: when the whole segment is dead, most candidates fail at
+    TCP connect - failing them in 2.0s instead of 4.0s halves how long a
+    worker thread is blocked, and a worker pool flooded by all-dead probes
+    starves every other query (Bilibili etc. are plain passthrough but share
+    the same pool -> whole machine appears offline). Fast edges connect in
+    ms, so nothing real is harmed; slow-but-live edges still connect well
+    under 2.0s and then get the full TLS+HTTP budget."""
     st = time.time()
     deadline = st + timeout
     s = None
@@ -575,7 +628,7 @@ def probe_http(ip, host, port=443, timeout=TCP_TIMEOUT):
     try:
         ctx = _get_ssl_ctx()
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.settimeout(timeout)
+        s.settimeout(tcp_timeout)
         s.connect((ip, port))
         ss = ctx.wrap_socket(s, server_hostname=host)
         ss.settimeout(max(0.2, deadline - time.time()))
@@ -660,11 +713,20 @@ def probe_fastest(ips, workers=20, timeout=TCP_TIMEOUT, host=None, collect_ms=30
 # ---------------------------------------------------------------------------
 # Domain routing state
 # ---------------------------------------------------------------------------
-# cache: qname -> {"ips": [..], "best": ip, "updated": ts, "cdn": bool}
+# cache: qname -> {"ips": [..], "best": ip, "addrs": [best, alt...], "updated": ts, "cdn": bool}
 _cache = {}
 _cache_lock = threading.Lock()
-# single-flight: qname -> threading.Event while a first lookup is in progress
+# probe-in-flight marker: qname -> True while a background probe is queued/running.
+# Used to dedupe (Windows queries both ::1 and 127.0.0.1 at the same time) and to
+# decide whether a fresh query must wait for the optimized answer or fall back fast.
 _inflight = {}
+# v2.17: probes NEVER block a query worker. A bounded executor runs the slow HTTP
+# probe rounds off the query path; the query thread answers immediately with the
+# last known-good edges (or raw resolver IPs) and the probe result lands in the
+# cache for the browser's retry / next asset. Without this, an all-dead round
+# (2-4s per name) flooded the shared 64-worker pool during a browser burst and
+# starved even passthrough names (Bilibili/Doubao) -> "everything is offline".
+_probe_executor = ThreadPoolExecutor(max_workers=16, thread_name_prefix="probe")
 # name -> (ts, [ip, ...]): last set of live IPs from a successful probe round.
 # Used as fail-open preference: when a probe round comes back all-dead during
 # a line flake, hand out the last known-good edges (the way Steam++ pins its
@@ -676,6 +738,47 @@ _LAST_LIVE_TTL = 600  # seconds before a last-live hint expires
 # pool: sorted list of ("ip", ms) for Cloudflare anycast, refreshed by worker
 _cf_sorted = [(ip, 0.0) for ip in CF_POOL]
 _cf_sorted_lock = threading.Lock()
+
+
+def _background_probe(name, cand, pool, qname_bytes):
+    """One probe round off the query path. Publishes winners into the cache
+    (+ last-live) so the browser's retry / next asset gets the optimized IP.
+    Called via the bounded _probe_executor, so an all-dead round (2-4s) can
+    never hold up a query worker or starve passthrough names."""
+    try:
+        winners, _ = probe_fastest(cand, timeout=TCP_TIMEOUT, host=name)
+        now = time.time()
+        if winners:
+            chosen = winners[0][0]
+            with _cache_lock:
+                entry = _cache.get(name)
+                if entry is None:
+                    entry = {"ips": cand, "best": chosen, "updated": now, "cdn": True}
+                else:
+                    entry["ips"] = cand
+                    entry["best"] = chosen
+                    entry["updated"] = now
+                    entry["cdn"] = True
+                entry["addrs"] = [ip for ip, _ in winners[:3]]
+                _cache[name] = entry
+            prune_cache()   # outside the lock: prune_cache acquires _cache_lock itself
+            with _last_live_lock:
+                _last_live[name] = (now, [ip for ip, _ in winners])
+            log.info("OPT  %s -> %s (pool of %d)" % (name, chosen, len(cand)))
+        else:
+            with _last_live_lock:
+                last = _last_live.get(name)
+            if last and now - last[0] < _LAST_LIVE_TTL:
+                log.warning("ALLDEAD %s (cand %d); fail-open last-live %d" % (name, len(cand), len(last[1])))
+            elif pool:
+                log.warning("ALLDEAD %s (cand %d); fallback raw %d" % (name, len(cand), len(pool)))
+            else:
+                log.warning("ALLDEAD %s (cand %d)" % (name, len(cand)))
+    except Exception as ex:
+        log.info("bg probe error %s: %s" % (name, ex))
+    finally:
+        with _cache_lock:
+            _inflight.pop(name, None)
 
 
 def get_cf_best():
@@ -732,28 +835,27 @@ def handle_query(data, addr):
 
     # --- A record
     if cached and (now - cached["updated"] < CACHE_TTL):
-        best = cached["best"]
+        best = cached.get("best")
         if best:
-            return build_response(q, 0, [make_a_answer(q["qname_bytes"], best)])
+            addrs = cached.get("addrs") or [best]
+            return build_response(q, 0, [make_a_answer(q["qname_bytes"], ip) for ip in addrs[:3]])
         resp = forward_upstream(data)
         return rewrite_id(resp, q["id"]) if resp else servfail_response(q)
 
-    # single-flight: if another thread is already resolving this name, wait
-    # for its result instead of probing again (Windows queries both ::1 and
-    # 127.0.0.1 at the same time - we only want one probe per name).
+    # A probe may already be queued for this name (Windows queries both ::1
+    # and 127.0.0.1 at once). Never wait on it - answer last-live / raw now;
+    # the background probe updates the cache and the browser retry hits the
+    # optimized IP. The inflight marker is set inside the pref/CDN branches
+    # right before they submit the probe.
     with _cache_lock:
-        ev = _inflight.get(name)
-    if ev is not None:
-        ev.wait(timeout=6.0)
-        with _cache_lock:
-            cached2 = _cache.get(name)
-        if cached2 and cached2.get("best"):
-            return build_response(q, 0, [make_a_answer(q["qname_bytes"], cached2["best"])])
+        probing = _inflight.get(name)
+    if probing:
+        with _last_live_lock:
+            last = _last_live.get(name)
+        if last and now - last[0] < _LAST_LIVE_TTL:
+            return build_response(q, 0, [make_a_answer(q["qname_bytes"], ip) for ip in last[1]])
         resp = forward_upstream(data)
         return rewrite_id(resp, q["id"]) if resp else servfail_response(q)
-    ev = threading.Event()
-    with _cache_lock:
-        _inflight[name] = ev
 
     try:
         # Fresh lookup: resolve upstream, probe, remember
@@ -769,9 +871,8 @@ def handle_query(data, addr):
             return rewrite_id(resp, q["id"]) if resp else servfail_response(q)
 
         # Preferred-pool hit (community/known candidates): probe pref + resolved
-        # IPs. Falls through to fail-open (raw resolved IPs) when the whole
-        # preferred pool is dead - no second round of probing (keeps first
-        # lookup fast: one parallel resolve + one probe round).
+        # IPs IN THE BACKGROUND (bounded executor). The query answers instantly
+        # with last-live / raw; the winner lands in the cache for the retry.
         pref = PREF_IPS.get(name)
         if pref:
             t_r = time.time()
@@ -779,30 +880,28 @@ def handle_query(data, addr):
             pool = [ip for ip, _ in extra if ":" not in ip]
             cand = [p for p in pref if p not in pool] + pool
             t_p = time.time()
-            winners, _ = probe_fastest(cand, timeout=TCP_TIMEOUT, host=name)
-            chosen = winners[0][0] if winners else None
-            log.info("TIMING %s resolve=%.0fms probe=%.0fms cand=%d chosen=%s" % (
-                name, (t_p - t_r) * 1000, (time.time() - t_p) * 1000, len(cand), chosen))
-            if chosen:
-                entry = {"ips": cand, "best": chosen, "updated": now, "cdn": True}
-                with _cache_lock:
-                    _cache[name] = entry
-                with _last_live_lock:
-                    _last_live[name] = (now, [ip for ip, _ in winners])
-                log.info("OPT  %s -> %s (pref, pool of %d)" % (name, chosen, len(cand)))
-                prune_cache()
-                answers = [make_a_answer(q["qname_bytes"], ip) for ip, _ in winners[:3]]
-                return build_response(q, 0, answers)
-            if pool:
-                log.warning("PREF-ALLDEAD %s (pool %d); fail-open raw %d" % (name, len(cand), len(pool)))
-                # do NOT cache: the raw IPs are dead right now (line outage);
-                # caching them would pin the site to a dead node for TTL.
-                # Prefer last known-good edges (Steam++ style pinned IPs) over
-                # raw resolver IPs, which may be a dead edge right now.
+            log.info("TIMING %s resolve=%.0fms probe=async cand=%d" % (
+                name, (t_p - t_r) * 1000, len(cand)))
+            with _cache_lock:
+                already = _inflight.get(name)
+            if already:
                 with _last_live_lock:
                     last = _last_live.get(name)
                 if last and now - last[0] < _LAST_LIVE_TTL:
                     return build_response(q, 0, [make_a_answer(q["qname_bytes"], ip) for ip in last[1]])
+                if pool:
+                    return build_response(q, 0, [make_a_answer(q["qname_bytes"], ip) for ip in pool])
+                return servfail_response(q)
+            with _cache_lock:
+                _inflight[name] = True
+            _probe_executor.submit(_background_probe, name, cand, pool, q["qname_bytes"])
+            with _last_live_lock:
+                last = _last_live.get(name)
+            if last and now - last[0] < _LAST_LIVE_TTL:
+                log.info("FASTFALLBACK %s last-live %d (bg probing)" % (name, len(last[1])))
+                return build_response(q, 0, [make_a_answer(q["qname_bytes"], ip) for ip in last[1]])
+            if pool:
+                log.info("FASTFALLBACK %s raw %d (bg probing)" % (name, len(pool)))
                 return build_response(q, 0, [make_a_answer(q["qname_bytes"], ip) for ip in pool])
             return servfail_response(q)
 
@@ -813,9 +912,10 @@ def handle_query(data, addr):
         if cdn:
             # Wider candidate pool for CDN names: measured CF edges + the
             # domain-specific IPs from upstream/public DNS (a reachable edge
-            # may only be returned by one resolver). ONE combined probe round:
-            # two serial rounds made the all-dead case take ~3s (cf round then
-            # pool round); a single round fails open within the 1.5s budget.
+            # may only be returned by one resolver) + last known-good edges.
+            # ONE combined probe round, run IN THE BACKGROUND (bounded
+            # executor) - the query answers instantly with last-live / raw
+            # and the winner lands in the cache for the browser retry.
             extra = resolve_multi_source(name, 1)
             pool = list(ips)
             for ip, _ in extra:
@@ -836,42 +936,26 @@ def handle_query(data, addr):
                     if ip not in cand:
                         cand.append(ip)
             cand = cand[:32]
-            winners, _ = probe_fastest(cand, timeout=TCP_TIMEOUT, host=name)
-            chosen = winners[0][0] if winners else None
-            if chosen is None:
-                # all candidates dead: keep previous best if it still answers
-                with _cache_lock:
-                    old = _cache.get(name)
-                if old and old.get("best"):
-                    old_ms = probe_http(old["best"], name, 443, TCP_TIMEOUT)
-                    if old_ms is not None:
-                        chosen = old["best"]
-            if chosen is None:
-                # all candidates dead: fall back to last known-good edges, then
-                # raw multi-source IPs so the browser can still try direct
-                # (Steam++-style fail-open, better than SERVFAIL)
-                with _last_live_lock:
-                    last = _last_live.get(name)
-                if last and now - last[0] < _LAST_LIVE_TTL:
-                    log.warning("ALLDEAD %s (cand %d); fail-open last-live %d" % (name, len(cand), len(last[1])))
-                    return build_response(q, 0, [make_a_answer(q["qname_bytes"], ip) for ip in last[1]])
-                v4 = [ip for ip in ips if ":" not in ip]
-                if v4:
-                    log.warning("ALLDEAD %s (cand %d); fallback raw %d" % (name, len(cand), len(v4)))
-                    return build_response(q, 0, [make_a_answer(q["qname_bytes"], ip) for ip in v4])
-                log.warning("ALLDEAD %s (cand %d)" % (name, len(cand)))
-                return servfail_response(q)
-            entry = {"ips": cand, "best": chosen, "updated": now, "cdn": True}
             with _cache_lock:
-                _cache[name] = entry
-            with _last_live_lock:
-                _last_live[name] = (now, [ip for ip, _ in winners])
-            log.info("OPT  %s -> %s (cdn, pool of %d)" % (name, chosen, len(cand)))
-            prune_cache()
-            answers = [make_a_answer(q["qname_bytes"], ip) for ip, _ in winners[:3]]
-            if not answers:
-                answers = [make_a_answer(q["qname_bytes"], chosen)]
-            return build_response(q, 0, answers)
+                already = _inflight.get(name)
+            if already:
+                if last and now - last[0] < _LAST_LIVE_TTL:
+                    return build_response(q, 0, [make_a_answer(q["qname_bytes"], ip) for ip in last[1]])
+                if pool:
+                    return build_response(q, 0, [make_a_answer(q["qname_bytes"], ip) for ip in pool])
+                return servfail_response(q)
+            with _cache_lock:
+                _inflight[name] = True
+            _probe_executor.submit(_background_probe, name, cand, pool, q["qname_bytes"])
+            # answer fast: last known-good edges, else raw multi-source IPs so
+            # the browser can still try direct (Steam++-style fail-open)
+            if last and now - last[0] < _LAST_LIVE_TTL:
+                log.info("FASTFALLBACK %s last-live %d (bg probing)" % (name, len(last[1])))
+                return build_response(q, 0, [make_a_answer(q["qname_bytes"], ip) for ip in last[1]])
+            if pool:
+                log.info("FASTFALLBACK %s raw %d (bg probing)" % (name, len(pool)))
+                return build_response(q, 0, [make_a_answer(q["qname_bytes"], ip) for ip in pool])
+            return servfail_response(q)
 
         # Non-CDN multi-IP: pass through the resolved IPs without probing.
         # These are domestic/regular sites whose DNS answer is already optimal
@@ -886,9 +970,9 @@ def handle_query(data, addr):
             _cache[name] = entry
         return build_response(q, 0, [make_a_answer(q["qname_bytes"], ip) for ip in v4])
     finally:
-        with _cache_lock:
-            _inflight.pop(name, None)
-        ev.set()
+        # _inflight cleanup is owned by _background_probe (it pops the marker
+        # when the probe round finishes); passthrough paths never set it.
+        pass
 
 
 # ---------------------------------------------------------------------------
