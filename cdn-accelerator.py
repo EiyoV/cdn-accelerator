@@ -1192,18 +1192,22 @@ def main():
 
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    s.bind((LISTEN_ADDR, port))
-    # also listen on IPv6 loopback ::1 so IPv6-configured clients hit us too
+    lan_mode = "--lan" in sys.argv
+    v4_addr = "0.0.0.0" if lan_mode else LISTEN_ADDR
+    s.bind((v4_addr, port))
+    # also listen on IPv6 loopback ::1 (or all :: in LAN mode) so IPv6-configured
+    # clients hit us too
     s6 = None
     try:
         s6 = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
         s6.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        s6.bind(("::1", port))
-        log.info("ipv6 listener on ::1:%d" % port)
+        s6.bind(("::" if lan_mode else "::1", port))
+        log.info("ipv6 listener on %s:%d%s" % ("::" if lan_mode else "::1", port,
+                                               " (LAN shared)" if lan_mode else ""))
     except Exception as ex:
         log.info("ipv6 listener failed: %s" % ex)
-    log.info("cdn-accelerator started on %s:%d, upstream=%s, cf-pool=%d" % (
-        LISTEN_ADDR, port, UPSTREAMS, len(CF_POOL)))
+    log.info("cdn-accelerator started on %s:%d, upstream=%s, cf-pool=%d%s" % (
+        v4_addr, port, UPSTREAMS, len(CF_POOL), " [LAN SHARED]" if lan_mode else ""))
 
     threading.Thread(target=refresh_worker, daemon=True).start()
     threading.Thread(target=health_worker, daemon=True).start()

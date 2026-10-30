@@ -84,6 +84,12 @@ foreach ($a in $stale) {
     } catch { Write-Host "WARN: could not sweep $($a.InterfaceAlias) : $_" }
 }
 
+# 4b. remove the LAN-mode firewall rule if present
+try {
+    & "$env:SystemRoot\System32\netsh.exe" advfirewall firewall delete rule name="cdn-accelerator-dns" | Out-Null
+    Write-Host "Firewall rule 'cdn-accelerator-dns' removed"
+} catch { }
+
 # 5. flush
 & "$env:SystemRoot\System32\ipconfig.exe" /flushdns | Out-Null
 Write-Host "Done. DNS flushed."

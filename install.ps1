@@ -1,6 +1,9 @@
 # CDN Accelerator - installer
 # Backs up current DNS, points system DNS to the local optimizer,
 # registers an on-logon scheduled task so it runs automatically.
+# Use: .\install.ps1 [-Lan]   (-Lan also opens UDP 53 to the LAN so phones /
+#       other devices on the same network can use the optimizer as their DNS)
+param([switch]$Lan)
 $ErrorActionPreference = 'Stop'
 $dir = Split-Path -Parent $MyInvocation.MyCommand.Path
 
@@ -80,14 +83,26 @@ Write-Host "System DNS -> 127.0.0.1 / ::1"
 #    some CDN names only after a ~1.2s timeout, and the query worker waited
 #    synchronously -> every affected page felt slow. With 2+ parallel sources
 #    the first responder wins (typical 10-60ms).
+#    -Lan adds the --lan flag (listen on 0.0.0.0/::) so phones on the same
+#    WiFi can use this machine's optimizer as their DNS.
 $orig = ($adapters | ForEach-Object { $_.ServerAddresses } | Where-Object { $_ -ne '127.0.0.1' -and $_ -notmatch ':' } | Select-Object -Unique | Select-Object -First 2)
 $upstreams = (@($orig) + @('223.5.5.5', '119.29.29.29')) | Select-Object -Unique | Select-Object -First 3 | Join-String -Separator ','
 if (-not $upstreams) { $upstreams = '223.5.5.5,119.29.29.29' }
-& $schtasks /Create /TN "cdn_accelerator" /TR "`"$pywExe`" -u `"$script`" --upstream $upstreams" /SC ONLOGON /F | Out-Null
-Write-Host "Scheduled task created (on logon), upstream=$upstreams"
+$lanFlag = ''
+if ($Lan) { $lanFlag = ' --lan' }
+& $schtasks /Create /TN "cdn_accelerator" /TR "`"$pywExe`" -u `"$script`" --upstream $upstreams$lanFlag" /SC ONLOGON /F | Out-Null
+Write-Host "Scheduled task created (on logon), upstream=$upstreams$(if ($Lan) { ', LAN shared' })"
+
+# 4b. LAN mode: allow inbound UDP 53 so phones/devices can query this machine
+if ($Lan) {
+    & "$env:SystemRoot\System32\netsh.exe" advfirewall firewall delete rule name="cdn-accelerator-dns" | Out-Null
+    & "$env:SystemRoot\System32\netsh.exe" advfirewall firewall add rule name="cdn-accelerator-dns" dir=in action=allow protocol=UDP localport=53 profile=any | Out-Null
+    Write-Host "Firewall: UDP 53 inbound allowed (LAN shared DNS)"
+}
 
 # 5. start it right now
 $argList = @('-u', "`"$script`"", '--upstream', $upstreams)
+if ($Lan) { $argList += '--lan' }
 Start-Process -FilePath $pywExe -ArgumentList $argList -WindowStyle Hidden
 Start-Sleep -Seconds 4
 
