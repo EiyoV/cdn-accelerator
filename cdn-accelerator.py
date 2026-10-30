@@ -227,6 +227,37 @@ def resolve_upstream_all(qname, qtype):
     return []
 
 
+PUBLIC_DNS = ["223.5.5.5", "119.29.29.29", "8.8.8.8"]
+
+
+def resolve_multi_source(qname, qtype):
+    """Query upstream + public DNS in parallel, merge unique A IPs.
+    Gives CDN domains a wider candidate pool (a reachable edge may only be
+    returned by one resolver, e.g. Akamai edges on some ISP routes)."""
+    sources = [up for up in UPSTREAMS] + PUBLIC_DNS
+    seen = []
+    lock = threading.Lock()
+
+    def _collect(server):
+        query = make_query(qname, qtype)
+        resp = forward_raw(query, server, timeout=2.0)
+        if not resp:
+            return
+        for ip, _ in extract_a_records(resp):
+            with lock:
+                if ip not in seen:
+                    seen.append(ip)
+
+    with ThreadPoolExecutor(max_workers=len(sources)) as ex:
+        futs = [ex.submit(_collect, srv) for srv in sources]
+        for f in futs:
+            try:
+                f.result()
+            except Exception:
+                pass
+    return [(ip, 60) for ip in seen]
+
+
 def make_query(qname, qtype):
     # encode qname from dotted form
     qb = b""
@@ -323,13 +354,62 @@ def probe_conn(ip, host=None, port=443, timeout=TCP_TIMEOUT):
             pass
 
 
+def probe_http(ip, host, port=443, timeout=TCP_TIMEOUT):
+    """TCP + TLS + real HTTP HEAD. A node is healthy only if it actually
+    answers HTTP (2xx/3xx/4xx/5xx). Catches 'TLS handshake ok but page can't
+    load' nodes (seen on Akamai/CF anycast on some ISP routes)."""
+    st = time.time()
+    s = None
+    ss = None
+    try:
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(timeout)
+        s.connect((ip, port))
+        ss = ctx.wrap_socket(s, server_hostname=host)
+        ss.do_handshake()
+        req = ("HEAD / HTTP/1.1\r\nHost: %s\r\nUser-Agent: cdn-accelerator/1.0\r\n"
+               "Connection: close\r\n\r\n") % host
+        ss.sendall(req.encode("ascii"))
+        data = b""
+        while b"\r\n\r\n" not in data:
+            chunk = ss.recv(4096)
+            if not chunk:
+                break
+            data += chunk
+            if len(data) > 16384:
+                break
+        head = data.split(b"\r\n", 1)[0]
+        parts = head.split(b" ", 2)
+        if len(parts) >= 2 and parts[1].isdigit():
+            code = int(parts[1])
+            if 200 <= code <= 599:
+                return (time.time() - st) * 1000.0
+        return None
+    except Exception:
+        return None
+    finally:
+        try:
+            if ss:
+                ss.close()
+        except Exception:
+            pass
+        try:
+            if s:
+                s.close()
+        except Exception:
+            pass
+
+
 def probe_fastest(ips, workers=20, timeout=TCP_TIMEOUT, host=None):
     if not ips:
         return None
     if len(ips) == 1:
         return (ips[0], 0.0)
     with ThreadPoolExecutor(max_workers=min(workers, len(ips))) as ex:
-        futures = {ex.submit(probe_conn, ip, host, 443, timeout): ip for ip in ips}
+        futures = {ex.submit(probe_http, ip, host, 443, timeout): ip for ip in ips}
         best = None
         best_ms = None
         for f in futures:
@@ -444,31 +524,56 @@ def handle_query(data, addr):
             resp = forward_upstream(data)
             return rewrite_id(resp, q["id"]) if resp else servfail_response(q)
 
-        # CDN if any resolved IP sits in a known CDN range and there are options
-        cdn = len(ips) >= 2 and any(is_cdn_ip(ip) for ip in ips[:6])
+        # CDN if any resolved IP sits in a known CDN range (single-IP counts
+        # too - DNS load balancing often returns one edge that may be dead)
+        cdn = any(is_cdn_ip(ip) for ip in ips[:6])
 
         if cdn:
+            # Wider candidate pool for CDN names: merge upstream + public DNS.
+            # A reachable Akamai/CF edge may only be returned by one resolver.
+            extra = resolve_multi_source(name, 1)
+            pool = list(ips)
+            for ip, _ in extra:
+                if ":" not in ip and ip not in pool:
+                    pool.append(ip)
             # Prefer the measured Cloudflare pool for CF domains
             cf_candidates = get_cf_fast(6)
             chosen, _ = probe_fastest(cf_candidates, timeout=TCP_TIMEOUT, host=name)
             if chosen is None:
-                chosen, _ = probe_fastest(ips, timeout=TCP_TIMEOUT, host=name)
+                chosen, _ = probe_fastest(pool, timeout=TCP_TIMEOUT, host=name)
             if chosen is None:
-                chosen = ips[0]
-            entry = {"ips": ips, "best": chosen, "updated": now, "cdn": True}
+                # all candidates dead: keep previous best if it still answers
+                with _cache_lock:
+                    old = _cache.get(name)
+                if old and old.get("best"):
+                    old_ms = probe_http(old["best"], name, 443, TCP_TIMEOUT)
+                    if old_ms is not None:
+                        chosen = old["best"]
+            if chosen is None:
+                log.warning("ALLDEAD %s (pool of %d, cf %d)" % (name, len(pool), len(cf_candidates)))
+                return servfail_response(q)
+            entry = {"ips": pool, "best": chosen, "updated": now, "cdn": True}
             with _cache_lock:
                 _cache[name] = entry
-            log.info("OPT  %s -> %s (cdn, pool of %d)" % (name, chosen, len(ips)))
+            log.info("OPT  %s -> %s (cdn, pool of %d)" % (name, chosen, len(pool)))
             prune_cache()
             return build_response(q, 0, [make_a_answer(q["qname_bytes"], chosen)])
 
         # Non-CDN multi-IP: pick fastest among resolved IPs
         if len(ips) > 1:
             chosen, _ = probe_fastest(ips, timeout=TCP_TIMEOUT, host=name)
-            if chosen is None:
-                chosen = ips[0]
         else:
             chosen = ips[0]
+        if chosen is None:
+            with _cache_lock:
+                old = _cache.get(name)
+            if old and old.get("best"):
+                old_ms = probe_http(old["best"], name, 443, TCP_TIMEOUT)
+                if old_ms is not None:
+                    chosen = old["best"]
+        if chosen is None:
+            log.warning("ALLDEAD %s (multi-ip)" % name)
+            return servfail_response(q)
         entry = {"ips": ips, "best": chosen, "updated": now, "cdn": False}
         with _cache_lock:
             _cache[name] = entry
@@ -492,7 +597,7 @@ def refresh_cf_pool():
     ips = [x[0] for x in pool_now]
     probed = []
     with ThreadPoolExecutor(max_workers=24) as ex:
-        futs = {ex.submit(probe_conn, ip, "cloudflare.com", 443, TCP_TIMEOUT): ip for ip in ips}
+        futs = {ex.submit(probe_http, ip, "cloudflare.com", 443, TCP_TIMEOUT): ip for ip in ips}
         for f in futs:
             ms = f.result()
             if ms is not None:
@@ -506,10 +611,16 @@ def refresh_cf_pool():
 
 
 def refresh_cached_domains():
-    """Re-probe the best node of every cached domain."""
+    """Re-check the best node of every cached domain. Conservative: keep the
+    current node while it still answers HTTP; only re-pick when it's dead
+    (prevents a good node being swapped for a bad one on every refresh)."""
     with _cache_lock:
         snapshot = [(k, v["ips"]) for k, v in _cache.items() if v["ips"]]
     for name, ips in snapshot:
+        with _cache_lock:
+            cur_best = _cache.get(name, {}).get("best")
+        if cur_best and probe_http(cur_best, name, 443, TCP_TIMEOUT) is not None:
+            continue
         chosen, _ = probe_fastest(ips, timeout=TCP_TIMEOUT, host=name)
         if chosen:
             with _cache_lock:
@@ -517,7 +628,7 @@ def refresh_cached_domains():
                 if e:
                     e["best"] = chosen
                     e["updated"] = time.time()
-                    log.info("REFRESH %s -> %s" % (name, chosen))
+                    log.info("REFRESH %s -> %s (old best dead)" % (name, chosen))
 
 
 def refresh_worker():
@@ -550,7 +661,7 @@ def health_worker():
                 else:
                     cur = None
             if cur:
-                ms = probe_conn(cur, "cloudflare.com", 443, TCP_TIMEOUT)
+                ms = probe_http(cur, "cloudflare.com", 443, TCP_TIMEOUT)
                 if ms is None:
                     log.info("HEALTH cf best %s dead -> re-pick" % cur)
                     refresh_cf_pool()
@@ -562,7 +673,7 @@ def health_worker():
                 best = e.get("best")
                 if not best:
                     continue
-                ms = probe_conn(best, name, 443, TCP_TIMEOUT)
+                ms = probe_http(best, name, 443, TCP_TIMEOUT)
                 if ms is not None:
                     continue
                 log.info("HEALTH %s best %s dead -> re-pick" % (name, best))
