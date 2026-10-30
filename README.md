@@ -35,7 +35,7 @@
 
 ## 安装
 
-> 前置：Windows 10/11，Python 3.10+（安装时勾选 "Add python.exe to PATH"；或把便携版 Python 放进 `python\` 目录）
+> 前置：Windows 10/11。**内置 `runtime\python312\`（官方 Python 3.12 便携版，自带系统证书库，保证优选探测的 HTTPS 证书验证正确）**；若删除该目录，则自动回退到系统 Python 3.10+（安装时勾选 "Add python.exe to PATH"，或把便携版 Python 放进 `python\` 目录）。
 
 1. 拷贝整个文件夹到目标电脑
 2. 右键 **`install.bat` → 以管理员身份运行**

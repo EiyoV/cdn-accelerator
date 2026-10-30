@@ -7,7 +7,8 @@ $dir = Split-Path -Parent $MyInvocation.MyCommand.Path
 # --- locate a usable Python (auto-detect; works on any machine) ---
 $pyExe = $null
 $candidates = @(
-    (Join-Path $dir 'python\python.exe'),       # bundled portable python next to this script
+    (Join-Path $dir 'runtime\python312\python.exe'),  # bundled python (has system CA)
+    (Join-Path $dir 'python\python.exe'),             # portable python next to this script
     (Join-Path $dir 'python.exe'),
     'pythonw.exe', 'python.exe',                 # on PATH
     "$env:LOCALAPPDATA\Programs\Python\Python*\python.exe",

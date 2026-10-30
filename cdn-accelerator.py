@@ -467,14 +467,14 @@ def extract_a_records(resp):
 # GitHub anycast IPs on certain ISP routes).
 # ---------------------------------------------------------------------------
 def probe_conn(ip, host=None, port=443, timeout=TCP_TIMEOUT):
-    """TCP connect + TLS handshake. Returns ms, or None on any failure."""
+    """TCP connect + TLS handshake (fully verified). Returns ms, or None."""
     st = time.time()
     s = None
     ss = None
     try:
         ctx = ssl.create_default_context()
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
+        ctx.check_hostname = True
+        ctx.verify_mode = ssl.CERT_REQUIRED
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.settimeout(timeout)
         s.connect((ip, port))
@@ -497,16 +497,17 @@ def probe_conn(ip, host=None, port=443, timeout=TCP_TIMEOUT):
 
 
 def probe_http(ip, host, port=443, timeout=TCP_TIMEOUT):
-    """TCP + TLS + real HTTP HEAD. A node is healthy only if it actually
-    answers HTTP (2xx/3xx/4xx/5xx). Catches 'TLS handshake ok but page can't
-    load' nodes (seen on Akamai/CF anycast on some ISP routes)."""
+    """TCP + TLS(fully verified, needs bundled/system CA) + real HTTP HEAD.
+    A node is healthy only if it answers HTTP 2xx/3xx AND its certificate
+    validates for `host`. Filters cross-tenant CDN nodes whose handshake
+    works but whose cert belongs to another site (privacy errors)."""
     st = time.time()
     s = None
     ss = None
     try:
         ctx = ssl.create_default_context()
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
+        ctx.check_hostname = True
+        ctx.verify_mode = ssl.CERT_REQUIRED
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.settimeout(timeout)
         s.connect((ip, port))
@@ -527,7 +528,7 @@ def probe_http(ip, host, port=443, timeout=TCP_TIMEOUT):
         parts = head.split(b" ", 2)
         if len(parts) >= 2 and parts[1].isdigit():
             code = int(parts[1])
-            if 200 <= code <= 599:
+            if 200 <= code <= 399:
                 return (time.time() - st) * 1000.0
         return None
     except Exception:
