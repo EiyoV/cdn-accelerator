@@ -601,7 +601,11 @@ def probe_http(ip, host, port=443, timeout=TCP_TIMEOUT):
         parts = head.split(b" ", 2)
         if len(parts) >= 2 and parts[1].isdigit():
             code = int(parts[1])
-            if 200 <= code <= 399:
+            # 2xx-4xx = the edge answered: the cert already validated for the
+            # host, and a 400/403/404 from GitHub/Akamai is just a UA/referrer
+            # policy, not a dead node. Requiring strict 2xx/3xx made real
+            # GitHub edges (api.github.com -> 403 without UA) look all-dead.
+            if 200 <= code <= 499:
                 return (time.time() - st) * 1000.0
         return None
     except Exception:
@@ -661,6 +665,13 @@ _cache = {}
 _cache_lock = threading.Lock()
 # single-flight: qname -> threading.Event while a first lookup is in progress
 _inflight = {}
+# name -> (ts, [ip, ...]): last set of live IPs from a successful probe round.
+# Used as fail-open preference: when a probe round comes back all-dead during
+# a line flake, hand out the last known-good edges (the way Steam++ pins its
+# community-picked IPs) instead of raw resolver IPs that may be dead right now.
+_last_live = {}
+_last_live_lock = threading.Lock()
+_LAST_LIVE_TTL = 600  # seconds before a last-live hint expires
 
 # pool: sorted list of ("ip", ms) for Cloudflare anycast, refreshed by worker
 _cf_sorted = [(ip, 0.0) for ip in CF_POOL]
@@ -776,6 +787,8 @@ def handle_query(data, addr):
                 entry = {"ips": cand, "best": chosen, "updated": now, "cdn": True}
                 with _cache_lock:
                     _cache[name] = entry
+                with _last_live_lock:
+                    _last_live[name] = (now, [ip for ip, _ in winners])
                 log.info("OPT  %s -> %s (pref, pool of %d)" % (name, chosen, len(cand)))
                 prune_cache()
                 answers = [make_a_answer(q["qname_bytes"], ip) for ip, _ in winners[:3]]
@@ -784,6 +797,12 @@ def handle_query(data, addr):
                 log.warning("PREF-ALLDEAD %s (pool %d); fail-open raw %d" % (name, len(cand), len(pool)))
                 # do NOT cache: the raw IPs are dead right now (line outage);
                 # caching them would pin the site to a dead node for TTL.
+                # Prefer last known-good edges (Steam++ style pinned IPs) over
+                # raw resolver IPs, which may be a dead edge right now.
+                with _last_live_lock:
+                    last = _last_live.get(name)
+                if last and now - last[0] < _LAST_LIVE_TTL:
+                    return build_response(q, 0, [make_a_answer(q["qname_bytes"], ip) for ip in last[1]])
                 return build_response(q, 0, [make_a_answer(q["qname_bytes"], ip) for ip in pool])
             return servfail_response(q)
 
@@ -819,9 +838,14 @@ def handle_query(data, addr):
                     if old_ms is not None:
                         chosen = old["best"]
             if chosen is None:
-                # all candidates dead: fall back to raw multi-source IPs so the
-                # browser can still try direct (Steam++-style fail-open, better
-                # than SERVFAIL which hard-blocks the page)
+                # all candidates dead: fall back to last known-good edges, then
+                # raw multi-source IPs so the browser can still try direct
+                # (Steam++-style fail-open, better than SERVFAIL)
+                with _last_live_lock:
+                    last = _last_live.get(name)
+                if last and now - last[0] < _LAST_LIVE_TTL:
+                    log.warning("ALLDEAD %s (cand %d); fail-open last-live %d" % (name, len(cand), len(last[1])))
+                    return build_response(q, 0, [make_a_answer(q["qname_bytes"], ip) for ip in last[1]])
                 v4 = [ip for ip in ips if ":" not in ip]
                 if v4:
                     log.warning("ALLDEAD %s (cand %d); fallback raw %d" % (name, len(cand), len(v4)))
@@ -831,6 +855,8 @@ def handle_query(data, addr):
             entry = {"ips": cand, "best": chosen, "updated": now, "cdn": True}
             with _cache_lock:
                 _cache[name] = entry
+            with _last_live_lock:
+                _last_live[name] = (now, [ip for ip, _ in winners])
             log.info("OPT  %s -> %s (cdn, pool of %d)" % (name, chosen, len(cand)))
             prune_cache()
             answers = [make_a_answer(q["qname_bytes"], ip) for ip, _ in winners[:3]]
