@@ -13,17 +13,19 @@ How it works:
   3. For Cloudflare domains (pokebonk.com etc.) it answers from a measured
      pool of fast Cloudflare anycast IPs, so the site rides the best edge.
   4. Non-CDN / single-IP domains are simply forwarded unchanged (transparent).
-  5. Every 5 minutes it re-probes cached domains and the CF pool, so it
-     always follows the current fastest path.
+  5. A health worker re-probes the currently-returned best node every 30s;
+     when a node goes bad it immediately re-picks or drops the cache entry,
+     so a stale slow/dead node never lingers for minutes.
 
 No third-party dependencies. Pure standard library.
-Run:  python cdn-accelerator.py [--port 53]
+Run:  python cdn-accelerator.py [--port 53] [--upstream 1.1.1.1,8.8.8.8]
 """
 
 import os
 import re
 import sys
 import time
+import ssl
 import socket
 import struct
 import threading
@@ -38,6 +40,13 @@ LISTEN_ADDR = "127.0.0.1"
 LISTEN_PORT = 53
 LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cdn-accelerator.log")
 LOG_MAX_BYTES = 1024 * 1024          # 1 MB, then rotate (truncate)
+REFRESH_INTERVAL = 300               # seconds between full CF pool re-measure
+HEALTH_INTERVAL = 30                 # seconds between health re-probes of live nodes
+TCP_TIMEOUT = 2.0                    # seconds per TCP handshake probe
+CACHE_TTL = REFRESH_INTERVAL         # answer cache validity
+ANSWER_TTL = 60                      # TTL we hand to the client
+MAX_CACHE = 2000                     # hard cap for domain cache entries
+MAX_WORKERS = 32                     # concurrent query handlers per socket
 CF_POOL = [
     "104.16.0.1", "104.16.1.1", "104.16.16.1", "104.16.32.1", "104.16.64.1",
     "104.16.96.1", "104.16.128.1", "104.16.132.229", "104.16.160.1", "104.16.192.82",
@@ -70,7 +79,6 @@ CDN_NETS = [
     "23.32.0.0/11", "184.84.0.0/14",
 ]
 _cdn_nets = [ipaddress.ip_network(n) for n in CDN_NETS]
-_cdn_lock = threading.Lock()
 
 
 def is_cdn_ip(ip_str):
@@ -157,11 +165,11 @@ def rewrite_id(data, qid):
     return data
 
 
-def make_a_answer(qname_bytes, ip_str, ttl=60):
+def make_a_answer(qname_bytes, ip_str, ttl=ANSWER_TTL):
     return (qname_bytes, 1, 1, ttl, 4, socket.inet_aton(ip_str))
 
 
-def make_aaaa_answer(qname_bytes, ip_str, ttl=60):
+def make_aaaa_answer(qname_bytes, ip_str, ttl=ANSWER_TTL):
     return (qname_bytes, 28, 1, ttl, 16, socket.inet_pton(socket.AF_INET6, ip_str))
 
 
@@ -170,8 +178,13 @@ def empty_response(question):
     return build_response(question, 0, [])
 
 
+def servfail_response(question):
+    """SERVFAIL - upstream unreachable."""
+    return build_response(question, 2, [])
+
+
 # ---------------------------------------------------------------------------
-# Upstream forwarding (UDP, with retry)
+# Upstream forwarding (UDP, with retry across all upstreams)
 # ---------------------------------------------------------------------------
 UPSTREAMS = []  # set at install / start: [original DNS servers]
 
@@ -187,6 +200,18 @@ def forward_raw(query, upstream, timeout=3.0):
         return None
     finally:
         s.close()
+
+
+def forward_upstream(data, retries=2):
+    """Forward a raw query to upstreams (each tried `retries` times).
+    Returns response bytes, or None when every upstream failed."""
+    upstreams = UPSTREAMS or ["223.5.5.5"]
+    for up in upstreams:
+        for _ in range(retries):
+            resp = forward_raw(data, up)
+            if resp:
+                return resp
+    return None
 
 
 def resolve_upstream_all(qname, qtype):
@@ -264,27 +289,47 @@ def extract_a_records(resp):
 
 
 # ---------------------------------------------------------------------------
-# TCP speed probing
+# TCP + TLS probing (TLS handshake means the node is truly usable, not just
+# TCP-reachable - catches nodes that accept TCP but fail HTTPS, e.g. some
+# GitHub anycast IPs on certain ISP routes).
 # ---------------------------------------------------------------------------
-def tcp_rtt(ip, port=443, timeout=2.0):
+def probe_conn(ip, host=None, port=443, timeout=TCP_TIMEOUT):
+    """TCP connect + TLS handshake. Returns ms, or None on any failure."""
     st = time.time()
+    s = None
+    ss = None
     try:
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.settimeout(timeout)
         s.connect((ip, port))
-        s.close()
+        ss = ctx.wrap_socket(s, server_hostname=host)
+        ss.do_handshake()
         return (time.time() - st) * 1000.0
     except Exception:
         return None
+    finally:
+        try:
+            if ss:
+                ss.close()
+        except Exception:
+            pass
+        try:
+            if s:
+                s.close()
+        except Exception:
+            pass
 
 
-def probe_fastest(ips, workers=20, timeout=2.0):
+def probe_fastest(ips, workers=20, timeout=TCP_TIMEOUT, host=None):
     if not ips:
         return None
     if len(ips) == 1:
         return (ips[0], 0.0)
     with ThreadPoolExecutor(max_workers=min(workers, len(ips))) as ex:
-        futures = {ex.submit(tcp_rtt, ip, 443, timeout): ip for ip in ips}
+        futures = {ex.submit(probe_conn, ip, host, 443, timeout): ip for ip in ips}
         best = None
         best_ms = None
         for f in futures:
@@ -301,7 +346,8 @@ def probe_fastest(ips, workers=20, timeout=2.0):
 # cache: qname -> {"ips": [..], "best": ip, "updated": ts, "cdn": bool}
 _cache = {}
 _cache_lock = threading.Lock()
-REFRESH_INTERVAL = 300  # seconds
+# single-flight: qname -> threading.Event while a first lookup is in progress
+_inflight = {}
 
 # pool: sorted list of ("ip", ms) for Cloudflare anycast, refreshed by worker
 _cf_sorted = [(ip, 0.0) for ip in CF_POOL]
@@ -320,6 +366,17 @@ def get_cf_fast(n=4):
         return [x[0] for x in _cf_sorted[:n]] if _cf_sorted else CF_POOL[:n]
 
 
+def prune_cache():
+    """Keep _cache under MAX_CACHE: drop the oldest half when over."""
+    with _cache_lock:
+        if len(_cache) <= MAX_CACHE:
+            return
+        items = sorted(_cache.items(), key=lambda kv: kv[1].get("updated", 0))
+        for k, _ in items[: len(items) // 2]:
+            del _cache[k]
+        log.info("CACHE pruned -> %d entries" % len(_cache))
+
+
 # ---------------------------------------------------------------------------
 # Main request handling
 # ---------------------------------------------------------------------------
@@ -333,8 +390,8 @@ def handle_query(data, addr):
 
     # Only handle A/AAAA; forward everything else (MX, TXT, NS ...)
     if qtype not in (1, 28):
-        resp = forward_raw(data, UPSTREAMS[0] if UPSTREAMS else "223.5.5.5")
-        return rewrite_id(resp, q["id"]) if resp else build_response(q, 2, [])
+        resp = forward_upstream(data)
+        return rewrite_id(resp, q["id"]) if resp else servfail_response(q)
 
     with _cache_lock:
         cached = _cache.get(name)
@@ -346,103 +403,217 @@ def handle_query(data, addr):
         if cached and cached.get("cdn"):
             return empty_response(q)
         # unknown domain: forward AAAA upstream, pass through
-        resp = forward_raw(data, UPSTREAMS[0] if UPSTREAMS else "223.5.5.5")
-        return rewrite_id(resp, q["id"]) if resp else empty_response(q)
+        resp = forward_upstream(data)
+        return rewrite_id(resp, q["id"]) if resp else servfail_response(q)
 
     # --- A record
-    if cached and (now - cached["updated"] < REFRESH_INTERVAL):
+    if cached and (now - cached["updated"] < CACHE_TTL):
         best = cached["best"]
         if best:
-            return build_response(q, 0, [make_a_answer(q["qname_bytes"], best, 60)])
-        resp = forward_raw(data, UPSTREAMS[0] if UPSTREAMS else "223.5.5.5")
-        return rewrite_id(resp, q["id"]) if resp else empty_response(q)
+            return build_response(q, 0, [make_a_answer(q["qname_bytes"], best)])
+        resp = forward_upstream(data)
+        return rewrite_id(resp, q["id"]) if resp else servfail_response(q)
 
-    # Fresh lookup: resolve upstream, probe, remember
-    answers = resolve_upstream_all(name, 1)   # A records
-    if not answers:
-        # fall back to plain forward
-        resp = forward_raw(data, UPSTREAMS[0] if UPSTREAMS else "223.5.5.5")
-        return rewrite_id(resp, q["id"]) if resp else empty_response(q)
+    # single-flight: if another thread is already resolving this name, wait
+    # for its result instead of probing again (Windows queries both ::1 and
+    # 127.0.0.1 at the same time - we only want one probe per name).
+    with _cache_lock:
+        ev = _inflight.get(name)
+    if ev is not None:
+        ev.wait(timeout=6.0)
+        with _cache_lock:
+            cached2 = _cache.get(name)
+        if cached2 and cached2.get("best"):
+            return build_response(q, 0, [make_a_answer(q["qname_bytes"], cached2["best"])])
+        resp = forward_upstream(data)
+        return rewrite_id(resp, q["id"]) if resp else servfail_response(q)
+    ev = threading.Event()
+    with _cache_lock:
+        _inflight[name] = ev
 
-    ips = [ip for ip, _ in answers if ":" not in ip]   # v4 only
-    if not ips:
-        resp = forward_raw(data, UPSTREAMS[0] if UPSTREAMS else "223.5.5.5")
-        return rewrite_id(resp, q["id"]) if resp else empty_response(q)
+    try:
+        # Fresh lookup: resolve upstream, probe, remember
+        answers = resolve_upstream_all(name, 1)   # A records
+        if not answers:
+            # fall back to plain forward
+            resp = forward_upstream(data)
+            return rewrite_id(resp, q["id"]) if resp else servfail_response(q)
 
-    cdn = is_cdn_ip(ips[0]) and len(ips) >= 2
+        ips = [ip for ip, _ in answers if ":" not in ip]   # v4 only
+        if not ips:
+            resp = forward_upstream(data)
+            return rewrite_id(resp, q["id"]) if resp else servfail_response(q)
 
-    if cdn:
-        # Prefer the measured Cloudflare pool for CF domains
-        cf_candidates = get_cf_fast(6)
-        chosen, _ = probe_fastest(cf_candidates, timeout=2.0)
-        if chosen is None:
-            chosen, _ = probe_fastest(ips, timeout=2.0)
-        if chosen is None:
+        # CDN if any resolved IP sits in a known CDN range and there are options
+        cdn = len(ips) >= 2 and any(is_cdn_ip(ip) for ip in ips[:6])
+
+        if cdn:
+            # Prefer the measured Cloudflare pool for CF domains
+            cf_candidates = get_cf_fast(6)
+            chosen, _ = probe_fastest(cf_candidates, timeout=TCP_TIMEOUT, host=name)
+            if chosen is None:
+                chosen, _ = probe_fastest(ips, timeout=TCP_TIMEOUT, host=name)
+            if chosen is None:
+                chosen = ips[0]
+            entry = {"ips": ips, "best": chosen, "updated": now, "cdn": True}
+            with _cache_lock:
+                _cache[name] = entry
+            log.info("OPT  %s -> %s (cdn, pool of %d)" % (name, chosen, len(ips)))
+            prune_cache()
+            return build_response(q, 0, [make_a_answer(q["qname_bytes"], chosen)])
+
+        # Non-CDN multi-IP: pick fastest among resolved IPs
+        if len(ips) > 1:
+            chosen, _ = probe_fastest(ips, timeout=TCP_TIMEOUT, host=name)
+            if chosen is None:
+                chosen = ips[0]
+        else:
             chosen = ips[0]
-        entry = {"ips": ips, "best": chosen, "updated": now, "cdn": True}
+        entry = {"ips": ips, "best": chosen, "updated": now, "cdn": False}
         with _cache_lock:
             _cache[name] = entry
-        log.info("OPT  %s -> %s (cdn, pool of %d)" % (name, chosen, len(ips)))
-        return build_response(q, 0, [make_a_answer(q["qname_bytes"], chosen, 60)])
-
-    # Non-CDN multi-IP: pick fastest among resolved IPs
-    if len(ips) > 1:
-        chosen, _ = probe_fastest(ips, timeout=2.0)
-        if chosen is None:
-            chosen = ips[0]
-    else:
-        chosen = ips[0]
-    entry = {"ips": ips, "best": chosen, "updated": now, "cdn": False}
-    with _cache_lock:
-        _cache[name] = entry
-    log.info("OPT  %s -> %s (multi-ip)" % (name, chosen))
-    return build_response(q, 0, [make_a_answer(q["qname_bytes"], chosen, 60)])
+        log.info("OPT  %s -> %s (multi-ip)" % (name, chosen))
+        prune_cache()
+        return build_response(q, 0, [make_a_answer(q["qname_bytes"], chosen)])
+    finally:
+        with _cache_lock:
+            _inflight.pop(name, None)
+        ev.set()
 
 
 # ---------------------------------------------------------------------------
-# Background pool / cache refresher
+# Background workers
 # ---------------------------------------------------------------------------
-def refresh_worker():
+def refresh_cf_pool():
+    """Measure every CF pool IP and keep the sorted list of live ones."""
     global _cf_sorted
+    with _cf_sorted_lock:
+        pool_now = list(_cf_sorted)
+    ips = [x[0] for x in pool_now]
+    probed = []
+    with ThreadPoolExecutor(max_workers=24) as ex:
+        futs = {ex.submit(probe_conn, ip, "cloudflare.com", 443, TCP_TIMEOUT): ip for ip in ips}
+        for f in futs:
+            ms = f.result()
+            if ms is not None:
+                probed.append((futs[f], ms))
+    probed.sort(key=lambda x: x[1])
+    if probed:
+        with _cf_sorted_lock:
+            _cf_sorted = probed
+        log.info("POOL refreshed: best=%s %.0fms (ok %d/%d)" % (
+            probed[0][0], probed[0][1], len(probed), len(ips)))
+
+
+def refresh_cached_domains():
+    """Re-probe the best node of every cached domain."""
+    with _cache_lock:
+        snapshot = [(k, v["ips"]) for k, v in _cache.items() if v["ips"]]
+    for name, ips in snapshot:
+        chosen, _ = probe_fastest(ips, timeout=TCP_TIMEOUT, host=name)
+        if chosen:
+            with _cache_lock:
+                e = _cache.get(name)
+                if e:
+                    e["best"] = chosen
+                    e["updated"] = time.time()
+                    log.info("REFRESH %s -> %s" % (name, chosen))
+
+
+def refresh_worker():
+    # warm up the CF pool immediately on start (no 5-minute wait)
+    try:
+        refresh_cf_pool()
+        log.info("WARMUP done: cf best=%s" % get_cf_best())
+    except Exception as ex:
+        log.info("warmup error: %s" % ex)
     while True:
         time.sleep(REFRESH_INTERVAL)
         try:
-            # refresh Cloudflare pool
-            with _cf_sorted_lock:
-                pool_now = list(_cf_sorted)
-            ips = [x[0] for x in pool_now]
-            probed = []
-            with ThreadPoolExecutor(max_workers=24) as ex:
-                futs = {ex.submit(tcp_rtt, ip, 443, 2.0): ip for ip in ips}
-                for f in futs:
-                    ms = f.result()
-                    if ms is not None:
-                        probed.append((futs[f], ms))
-            probed.sort(key=lambda x: x[1])
-            if probed:
-                with _cf_sorted_lock:
-                    _cf_sorted = probed
-                log.info("POOL refreshed: best=%s %.0fms (ok %d/%d)" % (
-                    probed[0][0], probed[0][1], len(probed), len(ips)))
-            # refresh cached domains
-            with _cache_lock:
-                snapshot = [(k, v["ips"]) for k, v in _cache.items() if v["ips"]]
-            for name, ips in snapshot:
-                chosen, _ = probe_fastest(ips, timeout=2.0)
-                if chosen:
-                    with _cache_lock:
-                        e = _cache.get(name)
-                        if e:
-                            e["best"] = chosen
-                            e["updated"] = time.time()
-                            log.info("REFRESH %s -> %s" % (name, chosen))
+            refresh_cf_pool()
+            refresh_cached_domains()
         except Exception as ex:
             log.info("refresh error: %s" % ex)
+
+
+def health_worker():
+    """Every HEALTH_INTERVAL seconds re-probe the nodes we are actually
+    returning. If the live best node is dead, immediately re-pick from the
+    remaining candidates (CF pool) or drop/refresh the cache entry."""
+    while True:
+        time.sleep(HEALTH_INTERVAL)
+        try:
+            # 1) current CF pool favourite
+            with _cf_sorted_lock:
+                if _cf_sorted:
+                    cur = _cf_sorted[0][0]
+                else:
+                    cur = None
+            if cur:
+                ms = probe_conn(cur, "cloudflare.com", 443, TCP_TIMEOUT)
+                if ms is None:
+                    log.info("HEALTH cf best %s dead -> re-pick" % cur)
+                    refresh_cf_pool()
+
+            # 2) cached domains (CDN + multi-IP)
+            with _cache_lock:
+                snapshot = [(k, dict(v)) for k, v in list(_cache.items())]
+            for name, e in snapshot:
+                best = e.get("best")
+                if not best:
+                    continue
+                ms = probe_conn(best, name, 443, TCP_TIMEOUT)
+                if ms is not None:
+                    continue
+                log.info("HEALTH %s best %s dead -> re-pick" % (name, best))
+                ips = e.get("ips") or []
+                chosen, _ = probe_fastest(ips, timeout=TCP_TIMEOUT, host=name)
+                with _cache_lock:
+                    cur_e = _cache.get(name)
+                    if cur_e is None:
+                        continue
+                    if chosen:
+                        cur_e["best"] = chosen
+                        cur_e["updated"] = time.time()
+                        log.info("REPICK %s -> %s" % (name, chosen))
+                    else:
+                        del _cache[name]
+                        log.info("DROPPED %s (all ips dead)" % name)
+        except Exception as ex:
+            log.info("health error: %s" % ex)
 
 
 # ---------------------------------------------------------------------------
 # UDP server
 # ---------------------------------------------------------------------------
+def handle_one(sock, data, addr):
+    try:
+        resp = handle_query(data, addr)
+        if resp:
+            sock.sendto(resp, addr)
+    except OSError as ex:
+        # WinError 10054: client sent ICMP unreachable after we answered - benign
+        if getattr(ex, "winerror", None) != 10054:
+            log.info("handler error: %s" % ex)
+    except Exception as ex:
+        log.info("handler error: %s" % ex)
+
+
+def serve(sock):
+    executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
+    while True:
+        try:
+            data, addr = sock.recvfrom(4096)
+            executor.submit(handle_one, sock, data, addr)
+        except KeyboardInterrupt:
+            break
+        except OSError as ex:
+            if getattr(ex, "winerror", None) != 10054:
+                log.info("handler error: %s" % ex)
+        except Exception as ex:
+            log.info("handler error: %s" % ex)
+
+
 def main():
     global UPSTREAMS
     port = LISTEN_PORT
@@ -475,24 +646,8 @@ def main():
     log.info("cdn-accelerator started on %s:%d, upstream=%s, cf-pool=%d" % (
         LISTEN_ADDR, port, UPSTREAMS, len(CF_POOL)))
 
-    t = threading.Thread(target=refresh_worker, daemon=True)
-    t.start()
-
-    def serve(sock):
-        while True:
-            try:
-                data, addr = sock.recvfrom(4096)
-                resp = handle_query(data, addr)
-                if resp:
-                    sock.sendto(resp, addr)
-            except KeyboardInterrupt:
-                break
-            except OSError as ex:
-                # WinError 10054: client sent ICMP unreachable after we answered - benign
-                if getattr(ex, "winerror", None) != 10054:
-                    log.info("handler error: %s" % ex)
-            except Exception as ex:
-                log.info("handler error: %s" % ex)
+    threading.Thread(target=refresh_worker, daemon=True).start()
+    threading.Thread(target=health_worker, daemon=True).start()
 
     t4 = threading.Thread(target=serve, args=(s,), daemon=True)
     t4.start()
