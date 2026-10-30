@@ -713,6 +713,13 @@ def handle_query(data, addr):
                     if old_ms is not None:
                         chosen = old["best"]
             if chosen is None:
+                # all candidates dead: fall back to raw multi-source IPs so the
+                # browser can still try direct (Steam++-style fail-open, better
+                # than SERVFAIL which hard-blocks the page)
+                v4 = [ip for ip in ips if ":" not in ip]
+                if v4:
+                    log.warning("ALLDEAD %s (pool of %d, cf %d); fallback raw %d" % (name, len(pool), len(cf_candidates), len(v4)))
+                    return build_response(q, 0, [make_a_answer(q["qname_bytes"], ip) for ip in v4])
                 log.warning("ALLDEAD %s (pool of %d, cf %d)" % (name, len(pool), len(cf_candidates)))
                 return servfail_response(q)
             entry = {"ips": pool, "best": chosen, "updated": now, "cdn": True}
@@ -735,6 +742,10 @@ def handle_query(data, addr):
                 if old_ms is not None:
                     chosen = old["best"]
         if chosen is None:
+            v4 = [ip for ip in ips if ":" not in ip]
+            if v4:
+                log.warning("ALLDEAD %s (multi-ip); fallback raw %d" % (name, len(v4)))
+                return build_response(q, 0, [make_a_answer(q["qname_bytes"], ip) for ip in v4])
             log.warning("ALLDEAD %s (multi-ip)" % name)
             return servfail_response(q)
         entry = {"ips": ips, "best": chosen, "updated": now, "cdn": False}
