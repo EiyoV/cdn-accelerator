@@ -30,23 +30,24 @@ if "--upstream" in sys.argv:
         pass
 LAN = "--lan" in sys.argv
 
-# localhost query (A record) - reuses the wire format from the main app
-_PKT = (b"\x00\x01\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00"
-        b"\x07localhost\x00\x00\x01\x00\x01")
-
-
 def alive():
-    """True if something is listening and answering on 127.0.0.1:53."""
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    s.settimeout(1.0)
-    try:
-        s.sendto(_PKT, ("127.0.0.1", 53))
-        data, _ = s.recvfrom(512)
-        return len(data) > 0
-    except Exception:
-        return False
-    finally:
-        s.close()
+    """True if some process already listens on the DNS port.
+
+    Probe by TRYING TO BIND without SO_REUSEADDR: bind fails when a listener
+    exists, succeeds (we close immediately) when it is free. BOTH bind
+    addresses are tested: in LAN mode the optimizer binds 0.0.0.0, and on
+    Windows binding 127.0.0.1 can succeed even though 0.0.0.0:53 is taken -
+    a single-address probe would misread "free" and relaunch an instance that
+    then dies on bind (the zombie-farm bug). Either bind failing means alive."""
+    for addr in ("127.0.0.1", "0.0.0.0"):
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            s.bind((addr, 53))
+        except OSError:
+            return True  # in use -> a listener exists
+        finally:
+            s.close()
+    return False  # both free -> nobody listening -> not alive
 
 
 def start():

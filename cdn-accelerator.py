@@ -1191,7 +1191,11 @@ def main():
         UPSTREAMS = ["223.5.5.5", "119.29.29.29", "192.168.1.1"]
 
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    # NO SO_REUSEADDR: on Windows UDP it allows several sockets to share the
+    # same port, so a second instance binds successfully, datagrams get
+    # scattered across them and the watchdog misreads "alive". With the flag
+    # off, a second instance fails to bind, logs FATAL and exits - single
+    # instance guaranteed (and the watchdog's bind-probe is then reliable).
     lan_mode = "--lan" in sys.argv
     v4_addr = "0.0.0.0" if lan_mode else LISTEN_ADDR
     s.bind((v4_addr, port))
@@ -1200,7 +1204,6 @@ def main():
     s6 = None
     try:
         s6 = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
-        s6.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         s6.bind(("::" if lan_mode else "::1", port))
         log.info("ipv6 listener on %s:%d%s" % ("::" if lan_mode else "::1", port,
                                                " (LAN shared)" if lan_mode else ""))
