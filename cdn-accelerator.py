@@ -118,6 +118,8 @@ except Exception as _ex:
 WARMUP_DOMAINS = [
     "store.steampowered.com", "steamcommunity.com", "help.steampowered.com",
     "api.steampowered.com", "steamcdn-a.akamaihd.net", "steampipe-a.akamaihd.net",
+    "steamstatic.com", "steamcontent.com", "store.akamai.steamstatic.com",
+    "community.akamai.steamstatic.com", "client-update.akamai.steamstatic.com",
     "github.com", "api.github.com", "raw.githubusercontent.com",
     "assets-cdn.github.com", "github.global.ssl.fastly.net",
     "avatars.githubusercontent.com", "codeload.github.com", "gist.github.com",
@@ -126,6 +128,7 @@ WARMUP_DOMAINS = [
     "rockstargames.com", "riotgames.com", "leagueoflegends.com",
     "blizzard.com", "battle.net", "xbox.com", "playstation.com",
     "nintendo.com", "minecraft.net", "minecraft.com",
+    "pixiv.net", "reddit.com", "gitee.com",
 ]
 for _k in PREF_IPS:
     if _k not in WARMUP_DOMAINS:
