@@ -619,23 +619,35 @@ def probe_http(ip, host, port=443, timeout=TCP_TIMEOUT):
             pass
 
 
-def probe_fastest(ips, workers=20, timeout=TCP_TIMEOUT, host=None):
+def probe_fastest(ips, workers=20, timeout=TCP_TIMEOUT, host=None, collect_ms=300):
+    """Probe candidates in parallel. Answer fast but not blindly first-answer:
+    within a short collect window (default 300ms from probe start) prefer the
+    fastest success; if nothing succeeds inside the window, return the first
+    success as it arrives (line-recovery nodes handshake slowly and must not
+    add 300ms to every lookup). All-dead -> (None, None) after the budget.
+    A single candidate is still probed - returning it unprobed could hand
+    out a dead IP."""
     if not ips:
-        return None
+        return (None, None)
     if len(ips) == 1:
-        return (ips[0], 0.0)
-    # Return the FIRST node that answers (as_completed), not the global
-    # fastest: waiting for every candidate to finish lets a slow/timing-out
-    # node stall the DNS reply for seconds. First-answer is also what
-    # Steam++ does - get a live node out immediately.
+        ms = probe_http(ips[0], host, 443, timeout)
+        return (ips[0], ms) if ms is not None else (None, None)
+    st = time.time()
+    deadline_collect = st + (collect_ms / 1000.0)
+    best = None
     with ThreadPoolExecutor(max_workers=min(workers, len(ips))) as ex:
         futures = {ex.submit(probe_http, ip, host, 443, timeout): ip for ip in ips}
         for f in as_completed(futures):
             ip = futures[f]
             ms = f.result()
             if ms is not None:
-                return (ip, ms)
-    return (None, None)
+                if best is None or ms < best[1]:
+                    best = (ip, ms)
+                if time.time() >= deadline_collect:
+                    break
+    if best is None:
+        return (None, None)
+    return best
 
 
 # ---------------------------------------------------------------------------
@@ -775,18 +787,23 @@ def handle_query(data, addr):
         cdn = any(is_cdn_ip(ip) for ip in ips[:6])
 
         if cdn:
-            # Wider candidate pool for CDN names: merge upstream + public DNS.
-            # A reachable Akamai/CF edge may only be returned by one resolver.
+            # Wider candidate pool for CDN names: measured CF edges + the
+            # domain-specific IPs from upstream/public DNS (a reachable edge
+            # may only be returned by one resolver). ONE combined probe round:
+            # two serial rounds made the all-dead case take ~3s (cf round then
+            # pool round); a single round fails open within the 1.5s budget.
             extra = resolve_multi_source(name, 1)
             pool = list(ips)
             for ip, _ in extra:
                 if ":" not in ip and ip not in pool:
                     pool.append(ip)
-            # Prefer the measured Cloudflare pool for CF domains
-            cf_candidates = get_cf_fast(6)
-            chosen, _ = probe_fastest(cf_candidates, timeout=TCP_TIMEOUT, host=name)
-            if chosen is None:
-                chosen, _ = probe_fastest(pool, timeout=TCP_TIMEOUT, host=name)
+            cf_candidates = get_cf_fast(12)
+            cand = []
+            for ip in cf_candidates + pool:
+                if ip not in cand:
+                    cand.append(ip)
+            cand = cand[:24]
+            chosen, _ = probe_fastest(cand, timeout=TCP_TIMEOUT, host=name)
             if chosen is None:
                 # all candidates dead: keep previous best if it still answers
                 with _cache_lock:
@@ -801,14 +818,14 @@ def handle_query(data, addr):
                 # than SERVFAIL which hard-blocks the page)
                 v4 = [ip for ip in ips if ":" not in ip]
                 if v4:
-                    log.warning("ALLDEAD %s (pool of %d, cf %d); fallback raw %d" % (name, len(pool), len(cf_candidates), len(v4)))
+                    log.warning("ALLDEAD %s (cand %d); fallback raw %d" % (name, len(cand), len(v4)))
                     return build_response(q, 0, [make_a_answer(q["qname_bytes"], ip) for ip in v4])
-                log.warning("ALLDEAD %s (pool of %d, cf %d)" % (name, len(pool), len(cf_candidates)))
+                log.warning("ALLDEAD %s (cand %d)" % (name, len(cand)))
                 return servfail_response(q)
-            entry = {"ips": pool, "best": chosen, "updated": now, "cdn": True}
+            entry = {"ips": cand, "best": chosen, "updated": now, "cdn": True}
             with _cache_lock:
                 _cache[name] = entry
-            log.info("OPT  %s -> %s (cdn, pool of %d)" % (name, chosen, len(pool)))
+            log.info("OPT  %s -> %s (cdn, pool of %d)" % (name, chosen, len(cand)))
             prune_cache()
             return build_response(q, 0, [make_a_answer(q["qname_bytes"], chosen)])
 
