@@ -112,6 +112,45 @@ try:
 except Exception as _ex:
     PREF_IPS = {}
 
+
+def fetch_live_pool():
+    """On startup, quietly refresh the preferred pool from GitHub520's
+    community-maintained hosts list (updated daily, so static IPs go stale
+    within hours on jittery routes). Runs in a daemon thread - any failure
+    is ignored and the local pool stays in effect; every candidate is still
+    HTTP-probed live before use, so stale IPs can never be handed out."""
+    try:
+        import urllib.request
+        url = "https://raw.githubusercontent.com/521xueweihan/GitHub520/master/hosts"
+        req = urllib.request.Request(url, headers={"User-Agent": "cdn-accelerator/2.9"})
+        with urllib.request.urlopen(req, timeout=6) as r:
+            text = r.read().decode("utf-8", "ignore")
+        merged = {}
+        for line in text.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split()
+            if len(parts) >= 2 and ":" not in parts[0]:
+                merged.setdefault(parts[1].lower(), []).append(parts[0])
+        if not merged:
+            log.info("LIVE-POOL: GitHub520 returned nothing, keeping local pool")
+            return
+        updated = 0
+        for host, ips in merged.items():
+            if host in PREF_IPS or "github" in host or "raw" in host or "objects" in host:
+                cur = list(PREF_IPS.get(host) or [])
+                for ip in ips:
+                    if ip not in cur:
+                        cur.append(ip)
+                PREF_IPS[host] = cur
+                updated += 1
+        with open(_PREF_FILE, "w", encoding="utf-8") as f:
+            json.dump({k: v for k, v in PREF_IPS.items()}, f, indent=2)
+        log.info("LIVE-POOL: refreshed %d GitHub520 hosts, pool now %d domains" % (updated, len(PREF_IPS)))
+    except Exception as ex:
+        log.info("LIVE-POOL: fetch failed (%s), keeping local pool" % ex)
+
 # Domains warmed up on startup (parse via multi-source DNS + probe, cache the
 # best). Includes the preferred-pool domains plus common gaming/social/dev
 # platforms whose IPs are gathered automatically at runtime.
@@ -1020,6 +1059,7 @@ def main():
 
     threading.Thread(target=refresh_worker, daemon=True).start()
     threading.Thread(target=health_worker, daemon=True).start()
+    threading.Thread(target=fetch_live_pool, daemon=True).start()
 
     t4 = threading.Thread(target=serve, args=(s,), daemon=True)
     t4.start()

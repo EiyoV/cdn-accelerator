@@ -1,22 +1,24 @@
 {
-  "_comment": "候选 IP 池（仅作为候选，实际连接前都会做 HTTP 级实测，选最快且能响应的；过期的 IP 会被自动滤掉）。来源：GitHub520 社区优选数据 (https://github.com/521xueweihan/GitHub520) + Akamai 段盲测活节点（2026-10-30 对桂林实测） + 多源 DNS 自动补充。",
   "github.com": [
     "140.82.112.3",
     "140.82.113.4",
     "140.82.114.4",
     "140.82.114.6",
-    "140.82.116.4"
+    "140.82.116.4",
+    "20.205.243.166"
   ],
   "api.github.com": [
     "140.82.114.6",
     "140.82.113.4",
-    "140.82.114.4"
+    "140.82.114.4",
+    "20.205.243.168"
   ],
   "raw.githubusercontent.com": [
     "185.199.111.133",
     "185.199.108.153",
     "185.199.109.153",
-    "185.199.110.153"
+    "185.199.110.153",
+    "185.199.109.133"
   ],
   "assets-cdn.github.com": [
     "185.199.109.153",
@@ -28,7 +30,8 @@
     "151.101.1.194",
     "151.101.65.194",
     "151.101.129.194",
-    "151.101.193.194"
+    "151.101.193.194",
+    "157.240.15.8"
   ],
   "avatars.githubusercontent.com": [
     "185.199.111.133",
@@ -38,18 +41,21 @@
   ],
   "codeload.github.com": [
     "140.82.114.9",
-    "140.82.113.4"
+    "140.82.113.4",
+    "20.205.243.165"
   ],
   "gist.github.com": [
     "140.82.113.4",
     "140.82.114.4",
-    "140.82.116.4"
+    "140.82.116.4",
+    "78.16.49.15"
   ],
   "github.githubassets.com": [
     "185.199.110.154",
     "185.199.108.154",
     "185.199.109.154",
-    "185.199.111.154"
+    "185.199.111.154",
+    "185.199.110.215"
   ],
   "objects.githubusercontent.com": [
     "185.199.111.133",
@@ -71,19 +77,23 @@
   ],
   "live.github.com": [
     "140.82.113.25",
-    "140.82.114.4"
+    "140.82.114.4",
+    "140.82.114.26"
   ],
   "alive.github.com": [
     "140.82.114.25",
-    "140.82.113.4"
+    "140.82.113.4",
+    "140.82.114.26"
   ],
   "central.github.com": [
     "140.82.113.22",
-    "140.82.114.4"
+    "140.82.114.4",
+    "140.82.114.22"
   ],
   "education.github.com": [
     "140.82.113.21",
-    "140.82.114.4"
+    "140.82.114.4",
+    "140.82.114.22"
   ],
   "store.steampowered.com": [
     "23.2.52.176",
@@ -253,5 +263,77 @@
     "23.53.95.55",
     "23.11.89.158",
     "23.44.153.110"
+  ],
+  "api.individual.githubcopilot.com": [
+    "140.82.114.21"
+  ],
+  "avatars0.githubusercontent.com": [
+    "185.199.109.133"
+  ],
+  "avatars1.githubusercontent.com": [
+    "185.199.109.133"
+  ],
+  "avatars2.githubusercontent.com": [
+    "185.199.109.133"
+  ],
+  "avatars3.githubusercontent.com": [
+    "185.199.109.133"
+  ],
+  "avatars4.githubusercontent.com": [
+    "185.199.109.133"
+  ],
+  "avatars5.githubusercontent.com": [
+    "185.199.109.133"
+  ],
+  "cloud.githubusercontent.com": [
+    "185.199.109.133"
+  ],
+  "collector.github.com": [
+    "140.82.113.21"
+  ],
+  "desktop.githubusercontent.com": [
+    "185.199.109.133"
+  ],
+  "favicons.githubusercontent.com": [
+    "185.199.109.133"
+  ],
+  "github-cloud.s3.amazonaws.com": [
+    "16.15.161.177"
+  ],
+  "github-com.s3.amazonaws.com": [
+    "16.15.207.237"
+  ],
+  "github-production-release-asset-2e65be.s3.amazonaws.com": [
+    "16.15.254.45"
+  ],
+  "github-production-repository-file-5c1aeb.s3.amazonaws.com": [
+    "54.231.230.34"
+  ],
+  "github-production-user-asset-6210df.s3.amazonaws.com": [
+    "16.15.228.128"
+  ],
+  "github.blog": [
+    "192.0.66.2"
+  ],
+  "github.community": [
+    "140.82.112.18"
+  ],
+  "github.io": [
+    "185.199.110.153"
+  ],
+  "github.map.fastly.net": [
+    "185.199.109.133"
+  ],
+  "githubstatus.com": [
+    "185.199.110.153"
+  ],
+  "media.githubusercontent.com": [
+    "185.199.109.133"
+  ],
+  "pipelines.actions.githubusercontent.com": [
+    "13.107.42.16"
+  ],
+  "private-user-images.githubusercontent.com": [
+    "185.199.109.133"
   ]
 }
