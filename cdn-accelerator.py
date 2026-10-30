@@ -43,9 +43,9 @@ LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cdn-acceler
 LOG_MAX_BYTES = 1024 * 1024          # 1 MB, then rotate (truncate)
 REFRESH_INTERVAL = 300               # seconds between full CF pool re-measure
 HEALTH_INTERVAL = 8                   # seconds between health re-probes of live nodes
-TCP_TIMEOUT = 2.0                     # seconds per TCP handshake probe
-CACHE_TTL = 8                         # answer cache validity (short: re-probe on visit)
-ANSWER_TTL = 10                       # TTL we hand to the client (browser re-asks fast)
+TCP_TIMEOUT = 1.5                     # seconds per TCP handshake probe
+CACHE_TTL = 60                         # answer cache validity (queries hit cache -> instant; liveness is kept fresh by health_worker)
+ANSWER_TTL = 15                        # TTL handed to the client (browser re-asks after 15s; health cycle is 8s)
 MAX_CACHE = 2000                     # hard cap for domain cache entries
 MAX_WORKERS = 32                     # concurrent query handlers per socket
 CF_POOL = [
@@ -369,7 +369,7 @@ def resolve_upstream_all(qname, qtype):
     return []
 
 
-PUBLIC_DNS = ["223.5.5.5", "119.29.29.29", "8.8.8.8"]
+PUBLIC_DNS = ["223.5.5.5", "119.29.29.29", "114.114.114.114"]
 
 
 def resolve_multi_source(qname, qtype):
@@ -382,7 +382,7 @@ def resolve_multi_source(qname, qtype):
 
     def _collect(server):
         query = make_query(qname, qtype)
-        resp = forward_raw(query, server, timeout=2.0)
+        resp = forward_raw(query, server, timeout=1.2)
         if not resp:
             return
         for ip, _ in extract_a_records(resp):
@@ -729,31 +729,18 @@ def handle_query(data, addr):
             prune_cache()
             return build_response(q, 0, [make_a_answer(q["qname_bytes"], chosen)])
 
-        # Non-CDN multi-IP: pick fastest among resolved IPs
-        if len(ips) > 1:
-            chosen, _ = probe_fastest(ips, timeout=TCP_TIMEOUT, host=name)
-        else:
-            chosen = ips[0]
-        if chosen is None:
-            with _cache_lock:
-                old = _cache.get(name)
-            if old and old.get("best"):
-                old_ms = probe_http(old["best"], name, 443, TCP_TIMEOUT)
-                if old_ms is not None:
-                    chosen = old["best"]
-        if chosen is None:
-            v4 = [ip for ip in ips if ":" not in ip]
-            if v4:
-                log.warning("ALLDEAD %s (multi-ip); fallback raw %d" % (name, len(v4)))
-                return build_response(q, 0, [make_a_answer(q["qname_bytes"], ip) for ip in v4])
-            log.warning("ALLDEAD %s (multi-ip)" % name)
-            return servfail_response(q)
-        entry = {"ips": ips, "best": chosen, "updated": now, "cdn": False}
+        # Non-CDN multi-IP: pass through the resolved IPs without probing.
+        # These are domestic/regular sites whose DNS answer is already optimal
+        # for the local route; probing them only adds latency (probes can take
+        # ~2s when candidates time out, making every page feel slow).
+        v4 = [ip for ip in ips if ":" not in ip]
+        if not v4:
+            resp = forward_upstream(data)
+            return rewrite_id(resp, q["id"]) if resp else servfail_response(q)
+        entry = {"ips": v4, "best": v4[0], "updated": now, "cdn": False}
         with _cache_lock:
             _cache[name] = entry
-        log.info("OPT  %s -> %s (multi-ip)" % (name, chosen))
-        prune_cache()
-        return build_response(q, 0, [make_a_answer(q["qname_bytes"], chosen)])
+        return build_response(q, 0, [make_a_answer(q["qname_bytes"], ip) for ip in v4])
     finally:
         with _cache_lock:
             _inflight.pop(name, None)
@@ -789,7 +776,7 @@ def refresh_cached_domains():
     current node while it still answers HTTP; only re-pick when it's dead
     (prevents a good node being swapped for a bad one on every refresh)."""
     with _cache_lock:
-        snapshot = [(k, v["ips"]) for k, v in _cache.items() if v["ips"]]
+        snapshot = [(k, v["ips"]) for k, v in _cache.items() if v.get("cdn") and v["ips"]]
     for name, ips in snapshot:
         with _cache_lock:
             cur_best = _cache.get(name, {}).get("best")
@@ -838,9 +825,10 @@ def health_worker():
                     log.info("HEALTH cf best %s dead -> re-pick" % cur)
                     refresh_cf_pool()
 
-            # 2) cached domains (CDN + multi-IP), checked and re-picked in parallel
+            # 2) cached CDN/pref domains only (pass-through domains are already
+            # optimal for the local route - probing them wastes bandwidth)
             with _cache_lock:
-                snapshot = [(k, dict(v)) for k, v in list(_cache.items())]
+                snapshot = [(k, dict(v)) for k, v in list(_cache.items()) if v.get("cdn")]
             if not snapshot:
                 continue
 
@@ -902,14 +890,18 @@ def warmup_worker():
         except Exception as _ex:
             pass
 
-    with ThreadPoolExecutor(max_workers=8) as ex:
-        futs = [ex.submit(_warm, d) for d in WARMUP_DOMAINS]
+    # warm-up throttled: only the first N core domains, delayed start so the
+    # DNS server answers queries immediately after boot (no start-up storm),
+    # low concurrency to keep first-visit lookups snappy
+    time.sleep(5)
+    with ThreadPoolExecutor(max_workers=6) as ex:
+        futs = [ex.submit(_warm, d) for d in WARMUP_DOMAINS[:100]]
         for f in futs:
             try:
                 f.result()
             except Exception:
                 pass
-    log.info("WARMUP domains done: %d" % len(WARMUP_DOMAINS))
+    log.info("WARMUP domains done: %d" % len(WARMUP_DOMAINS[:100]))
 
 
 # ---------------------------------------------------------------------------
