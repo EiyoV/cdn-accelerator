@@ -42,10 +42,10 @@ LISTEN_PORT = 53
 LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cdn-accelerator.log")
 LOG_MAX_BYTES = 1024 * 1024          # 1 MB, then rotate (truncate)
 REFRESH_INTERVAL = 300               # seconds between full CF pool re-measure
-HEALTH_INTERVAL = 30                 # seconds between health re-probes of live nodes
-TCP_TIMEOUT = 2.0                    # seconds per TCP handshake probe
-CACHE_TTL = REFRESH_INTERVAL         # answer cache validity
-ANSWER_TTL = 60                      # TTL we hand to the client
+HEALTH_INTERVAL = 8                   # seconds between health re-probes of live nodes
+TCP_TIMEOUT = 2.0                     # seconds per TCP handshake probe
+CACHE_TTL = 8                         # answer cache validity (short: re-probe on visit)
+ANSWER_TTL = 10                       # TTL we hand to the client (browser re-asks fast)
 MAX_CACHE = 2000                     # hard cap for domain cache entries
 MAX_WORKERS = 32                     # concurrent query handlers per socket
 CF_POOL = [
@@ -811,47 +811,57 @@ def refresh_worker():
 
 def health_worker():
     """Every HEALTH_INTERVAL seconds re-probe the nodes we are actually
-    returning. If the live best node is dead, immediately re-pick from the
-    remaining candidates (CF pool) or drop/refresh the cache entry."""
+    returning, in parallel. If a live best node is dead, immediately re-pick
+    from the remaining candidates, so clients re-resolving (short TTL) always
+    get a live node within one health cycle."""
     while True:
         time.sleep(HEALTH_INTERVAL)
         try:
             # 1) current CF pool favourite
             with _cf_sorted_lock:
-                if _cf_sorted:
-                    cur = _cf_sorted[0][0]
-                else:
-                    cur = None
+                cur = _cf_sorted[0][0] if _cf_sorted else None
             if cur:
                 ms = probe_http(cur, "cloudflare.com", 443, TCP_TIMEOUT)
                 if ms is None:
                     log.info("HEALTH cf best %s dead -> re-pick" % cur)
                     refresh_cf_pool()
 
-            # 2) cached domains (CDN + multi-IP)
+            # 2) cached domains (CDN + multi-IP), checked and re-picked in parallel
             with _cache_lock:
                 snapshot = [(k, dict(v)) for k, v in list(_cache.items())]
-            for name, e in snapshot:
+            if not snapshot:
+                continue
+
+            def check_and_repick(item):
+                name, e = item
                 best = e.get("best")
                 if not best:
-                    continue
+                    return None
                 ms = probe_http(best, name, 443, TCP_TIMEOUT)
                 if ms is not None:
-                    continue
-                log.info("HEALTH %s best %s dead -> re-pick" % (name, best))
+                    return None
                 ips = e.get("ips") or []
                 chosen, _ = probe_fastest(ips, timeout=TCP_TIMEOUT, host=name)
+                return (name, best, chosen)
+
+            with ThreadPoolExecutor(max_workers=12) as ex:
+                results = list(ex.map(check_and_repick, snapshot))
+            for res in results:
+                if res is None:
+                    continue
+                name, old_best, chosen = res
+                if not chosen:
+                    with _cache_lock:
+                        _cache.pop(name, None)
+                    log.info("DROPPED %s (all ips dead)" % name)
+                    continue
                 with _cache_lock:
                     cur_e = _cache.get(name)
                     if cur_e is None:
                         continue
-                    if chosen:
-                        cur_e["best"] = chosen
-                        cur_e["updated"] = time.time()
-                        log.info("REPICK %s -> %s" % (name, chosen))
-                    else:
-                        del _cache[name]
-                        log.info("DROPPED %s (all ips dead)" % name)
+                    cur_e["best"] = chosen
+                    cur_e["updated"] = time.time()
+                    log.info("REPICK %s: %s -> %s" % (name, old_best, chosen))
         except Exception as ex:
             log.info("health error: %s" % ex)
 
