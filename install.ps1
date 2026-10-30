@@ -93,6 +93,13 @@ if ($Lan) { $lanFlag = ' --lan' }
 & $schtasks /Create /TN "cdn_accelerator" /TR "`"$pywExe`" -u `"$script`" --upstream $upstreams$lanFlag" /SC ONLOGON /F | Out-Null
 Write-Host "Scheduled task created (on logon), upstream=$upstreams$(if ($Lan) { ', LAN shared' })"
 
+# 4a. watchdog: relaunches the optimizer within ~20s if it ever dies.
+#     Without it, a crash leaves system DNS pointing at a dead 127.0.0.1
+#     (cached pages open, new lookups fail - "bilibili opens, images don't").
+$watch = Join-Path $dir 'watch.py'
+& $schtasks /Create /TN "cdn_accelerator_watch" /TR "`"$pywExe`" `"$watch`" --upstream $upstreams$lanFlag" /SC ONLOGON /F | Out-Null
+Write-Host "Watchdog scheduled task created (auto-restart if the optimizer dies)"
+
 # 4b. LAN mode: allow inbound UDP 53 so phones/devices can query this machine
 if ($Lan) {
     & "$env:SystemRoot\System32\netsh.exe" advfirewall firewall delete rule name="cdn-accelerator-dns" | Out-Null

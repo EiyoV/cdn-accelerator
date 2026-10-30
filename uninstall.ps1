@@ -14,6 +14,14 @@ foreach ($p in $procs) {
 
 # 2. remove scheduled task
 try { & $schtasks /Delete /TN "cdn_accelerator" /F | Out-Null; Write-Host "Scheduled task removed" } catch { Write-Host "No scheduled task found" }
+try { & $schtasks /Delete /TN "cdn_accelerator_watch" /F | Out-Null; Write-Host "Watchdog task removed" } catch { Write-Host "No watchdog task found" }
+
+# 2b. stop the watchdog process too
+$wprocs = Get-CimInstance Win32_Process -Filter "Name like 'python%'" -ErrorAction SilentlyContinue |
+    Where-Object { $_.CommandLine -match 'watch\.py' }
+foreach ($p in $wprocs) {
+    try { Stop-Process -Id $p.ProcessId -Force -ErrorAction Stop; Write-Host "Stopped watchdog PID $($p.ProcessId)" } catch { }
+}
 
 # 3. restore original DNS
 if (Test-Path -LiteralPath $backup) {

@@ -1223,4 +1223,13 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception:
+        # pythonw has no console: an uncaught exception used to vanish without
+        # a trace, leaving system DNS pointed at a dead 127.0.0.1 (pages load
+        # from cache, everything new fails - "bilibili opens but images don't").
+        # Always write the crash to the log so the watchdog/next session can see it.
+        import traceback
+        log.error("FATAL crash: %s", traceback.format_exc())
+        raise
