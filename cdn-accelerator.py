@@ -821,12 +821,21 @@ def handle_query(data, addr):
             for ip, _ in extra:
                 if ":" not in ip and ip not in pool:
                     pool.append(ip)
-            cf_candidates = get_cf_fast(12)
+            cf_candidates = get_cf_fast(24)
             cand = []
             for ip in cf_candidates + pool:
                 if ip not in cand:
                     cand.append(ip)
-            cand = cand[:24]
+            # fold in the last known-good edges so a live node that fell out of
+            # the rotation still gets probed this round (else we would probe
+            # 24 dead CFs and fail open to it anyway)
+            with _last_live_lock:
+                last = _last_live.get(name)
+            if last and now - last[0] < _LAST_LIVE_TTL:
+                for ip in last[1]:
+                    if ip not in cand:
+                        cand.append(ip)
+            cand = cand[:32]
             winners, _ = probe_fastest(cand, timeout=TCP_TIMEOUT, host=name)
             chosen = winners[0][0] if winners else None
             if chosen is None:
