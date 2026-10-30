@@ -19,6 +19,7 @@ PYW = os.path.join(HERE, "runtime", "python312", "pythonw.exe")
 if not os.path.isfile(PYW):
     PYW = "pythonw.exe"
 MAIN = os.path.join(HERE, "cdn-accelerator.py")
+HEARTBEAT = os.path.join(HERE, "watch.heartbeat")
 
 # Parameters mirrored from the main process (install.ps1 passes the same ones).
 UPSTREAM = "192.168.1.1,223.5.5.5,119.29.29.29"
@@ -63,6 +64,15 @@ def start():
 def main():
     while True:
         try:
+            # heartbeat so check.py (Task Scheduler, every 5 min) can tell
+            # this watchdog is alive without needing wmic/powershell.exe
+            try:
+                now = time.time()
+                with open(HEARTBEAT, "w") as f:
+                    f.write("%d" % int(now))
+                os.utime(HEARTBEAT, (now, now))
+            except Exception:
+                pass
             if not alive():
                 start()
                 time.sleep(5)

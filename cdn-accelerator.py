@@ -655,10 +655,16 @@ def probe_http(ip, host, port=443, timeout=TCP_TIMEOUT, tcp_timeout=TCP_CONNECT_
         if len(parts) >= 2 and parts[1].isdigit():
             code = int(parts[1])
             # 2xx-4xx = the edge answered: the cert already validated for the
-            # host, and a 400/403/404 from GitHub/Akamai is just a UA/referrer
+            # host, and a 403/404 from GitHub/Akamai is just a UA/referrer
             # policy, not a dead node. Requiring strict 2xx/3xx made real
             # GitHub edges (api.github.com -> 403 without UA) look all-dead.
-            if 200 <= code <= 499:
+            # EXCEPT 400: a genuine edge never answers "GET /" with 400. A
+            # 400 with a valid TLS handshake is the signature of a poisoned /
+            # middle-box node (observed 2026-10-31: 20.27.177.114 answered
+            # github.com with HTTP 400 while every real edge gave 200/301/404,
+            # and git push through it failed). Counting 400 as live hands out
+            # an IP that connects yet rejects every request.
+            if 200 <= code <= 499 and code != 400:
                 return (time.time() - st) * 1000.0
         return None
     except Exception:

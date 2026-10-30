@@ -15,6 +15,7 @@ foreach ($p in $procs) {
 # 2. remove scheduled task
 try { & $schtasks /Delete /TN "cdn_accelerator" /F | Out-Null; Write-Host "Scheduled task removed" } catch { Write-Host "No scheduled task found" }
 try { & $schtasks /Delete /TN "cdn_accelerator_watch" /F | Out-Null; Write-Host "Watchdog task removed" } catch { Write-Host "No watchdog task found" }
+try { & $schtasks /Delete /TN "cdn_accelerator_check" /F | Out-Null; Write-Host "Keeper task removed" } catch { Write-Host "No keeper task found" }
 
 # 2b. stop the watchdog process too
 $wprocs = Get-CimInstance Win32_Process -Filter "Name like 'python%'" -ErrorAction SilentlyContinue |

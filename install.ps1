@@ -100,7 +100,15 @@ $watch = Join-Path $dir 'watch.py'
 & $schtasks /Create /TN "cdn_accelerator_watch" /TR "`"$pywExe`" `"$watch`" --upstream $upstreams$lanFlag" /SC ONLOGON /F | Out-Null
 Write-Host "Watchdog scheduled task created (auto-restart if the optimizer dies)"
 
-# 4b. LAN mode: allow inbound UDP 53 so phones/devices can query this machine
+# 4b. periodic keeper: every 5 minutes, owned by Task Scheduler so no app
+#     process tree (e.g. an assistant client that cleans up its children on
+#     exit) can kill the recovery path. check.py relaunches optimizer AND
+#     watchdog if both died. Pure bundled python - no powershell.exe/wmic.
+$check = Join-Path $dir 'check.py'
+& $schtasks /Create /TN "cdn_accelerator_check" /TR "`"$pywExe`" `"$check`"" /SC MINUTE /MO 5 /F | Out-Null
+Write-Host "Periodic keeper task created (every 5 min, scheduler-owned self-heal)"
+
+# 4c. LAN mode: allow inbound UDP 53 so phones/devices can query this machine
 if ($Lan) {
     & "$env:SystemRoot\System32\netsh.exe" advfirewall firewall delete rule name="cdn-accelerator-dns" | Out-Null
     & "$env:SystemRoot\System32\netsh.exe" advfirewall firewall add rule name="cdn-accelerator-dns" dir=in action=allow protocol=UDP localport=53 profile=any | Out-Null
