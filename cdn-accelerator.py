@@ -43,7 +43,7 @@ LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cdn-acceler
 LOG_MAX_BYTES = 1024 * 1024          # 1 MB, then rotate (truncate)
 REFRESH_INTERVAL = 300               # seconds between full CF pool re-measure
 HEALTH_INTERVAL = 8                   # seconds between health re-probes of live nodes
-TCP_TIMEOUT = 1.5                     # seconds per probe (hard total budget; SSL ctx is cached so this is a true budget)
+TCP_TIMEOUT = 4.0                     # seconds per probe (hard total budget; SSL ctx is cached so this is a true budget). 4s: a "slow-but-live" edge (github TTFB ~3s during degraded international windows) must count as live - a 1.5s budget killed the ONLY reachable GitHub edge and fail-open then handed out a truly dead raw IP (the exact "GitHub down = accelerator's fault" case). Fast edges return on first success, so this only delays all-dead/slow rounds - being able to open beats being fast to fail.
 CACHE_TTL = 60                         # answer cache validity (queries hit cache -> instant; liveness is kept fresh by health_worker)
 ANSWER_TTL = 15                        # TTL handed to the client (browser re-asks after 15s; health cycle is 8s)
 MAX_CACHE = 2000                     # hard cap for domain cache entries
