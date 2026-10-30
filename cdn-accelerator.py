@@ -619,35 +619,38 @@ def probe_http(ip, host, port=443, timeout=TCP_TIMEOUT):
             pass
 
 
-def probe_fastest(ips, workers=20, timeout=TCP_TIMEOUT, host=None, collect_ms=300):
-    """Probe candidates in parallel. Answer fast but not blindly first-answer:
-    within a short collect window (default 300ms from probe start) prefer the
-    fastest success; if nothing succeeds inside the window, return the first
-    success as it arrives (line-recovery nodes handshake slowly and must not
-    add 300ms to every lookup). All-dead -> (None, None) after the budget.
-    A single candidate is still probed - returning it unprobed could hand
-    out a dead IP."""
+def probe_fastest(ips, workers=20, timeout=TCP_TIMEOUT, host=None, collect_ms=300, top=3):
+    """Probe candidates in parallel. Return up to `top` LIVE candidates sorted
+    by measured latency (best first). Successes inside a short collect window
+    (default 300ms from probe start) are all kept, so the DNS answer can carry
+    several A records and the browser/system fail over automatically when the
+    best edge dies mid-session - the same robustness authoritative DNS gives.
+    If nothing succeeds inside the window, return the first success as it
+    arrives (line-recovery nodes handshake slowly and must not add 300ms to
+    every lookup). All-dead -> (None, None) after the budget. A single
+    candidate is still probed - returning it unprobed could hand out a dead
+    IP."""
     if not ips:
         return (None, None)
     if len(ips) == 1:
         ms = probe_http(ips[0], host, 443, timeout)
-        return (ips[0], ms) if ms is not None else (None, None)
+        return ([(ips[0], ms)] if ms is not None else [], None)
     st = time.time()
     deadline_collect = st + (collect_ms / 1000.0)
-    best = None
+    ok = []
     with ThreadPoolExecutor(max_workers=min(workers, len(ips))) as ex:
         futures = {ex.submit(probe_http, ip, host, 443, timeout): ip for ip in ips}
         for f in as_completed(futures):
             ip = futures[f]
             ms = f.result()
             if ms is not None:
-                if best is None or ms < best[1]:
-                    best = (ip, ms)
+                ok.append((ip, ms))
                 if time.time() >= deadline_collect:
                     break
-    if best is None:
+    if not ok:
         return (None, None)
-    return best
+    ok.sort(key=lambda x: x[1])
+    return (ok[:top], None)
 
 
 # ---------------------------------------------------------------------------
@@ -765,7 +768,8 @@ def handle_query(data, addr):
             pool = [ip for ip, _ in extra if ":" not in ip]
             cand = [p for p in pref if p not in pool] + pool
             t_p = time.time()
-            chosen, _ = probe_fastest(cand, timeout=TCP_TIMEOUT, host=name)
+            winners, _ = probe_fastest(cand, timeout=TCP_TIMEOUT, host=name)
+            chosen = winners[0][0] if winners else None
             log.info("TIMING %s resolve=%.0fms probe=%.0fms cand=%d chosen=%s" % (
                 name, (t_p - t_r) * 1000, (time.time() - t_p) * 1000, len(cand), chosen))
             if chosen:
@@ -774,7 +778,8 @@ def handle_query(data, addr):
                     _cache[name] = entry
                 log.info("OPT  %s -> %s (pref, pool of %d)" % (name, chosen, len(cand)))
                 prune_cache()
-                return build_response(q, 0, [make_a_answer(q["qname_bytes"], chosen)])
+                answers = [make_a_answer(q["qname_bytes"], ip) for ip, _ in winners[:3]]
+                return build_response(q, 0, answers)
             if pool:
                 log.warning("PREF-ALLDEAD %s (pool %d); fail-open raw %d" % (name, len(cand), len(pool)))
                 # do NOT cache: the raw IPs are dead right now (line outage);
@@ -803,7 +808,8 @@ def handle_query(data, addr):
                 if ip not in cand:
                     cand.append(ip)
             cand = cand[:24]
-            chosen, _ = probe_fastest(cand, timeout=TCP_TIMEOUT, host=name)
+            winners, _ = probe_fastest(cand, timeout=TCP_TIMEOUT, host=name)
+            chosen = winners[0][0] if winners else None
             if chosen is None:
                 # all candidates dead: keep previous best if it still answers
                 with _cache_lock:
@@ -827,7 +833,10 @@ def handle_query(data, addr):
                 _cache[name] = entry
             log.info("OPT  %s -> %s (cdn, pool of %d)" % (name, chosen, len(cand)))
             prune_cache()
-            return build_response(q, 0, [make_a_answer(q["qname_bytes"], chosen)])
+            answers = [make_a_answer(q["qname_bytes"], ip) for ip, _ in winners[:3]]
+            if not answers:
+                answers = [make_a_answer(q["qname_bytes"], chosen)]
+            return build_response(q, 0, answers)
 
         # Non-CDN multi-IP: pass through the resolved IPs without probing.
         # These are domestic/regular sites whose DNS answer is already optimal
@@ -882,7 +891,8 @@ def refresh_cached_domains():
             cur_best = _cache.get(name, {}).get("best")
         if cur_best and probe_http(cur_best, name, 443, TCP_TIMEOUT) is not None:
             continue
-        chosen, _ = probe_fastest(ips, timeout=TCP_TIMEOUT, host=name)
+        winners, _ = probe_fastest(ips, timeout=TCP_TIMEOUT, host=name)
+        chosen = winners[0][0] if winners else None
         if chosen:
             with _cache_lock:
                 e = _cache.get(name)
@@ -941,7 +951,8 @@ def health_worker():
                 if ms is not None:
                     return None
                 ips = e.get("ips") or []
-                chosen, _ = probe_fastest(ips, timeout=TCP_TIMEOUT, host=name)
+                winners, _ = probe_fastest(ips, timeout=TCP_TIMEOUT, host=name)
+                chosen = winners[0][0] if winners else None
                 return (name, best, chosen)
 
             with ThreadPoolExecutor(max_workers=12) as ex:
@@ -981,7 +992,8 @@ def warmup_worker():
                 ms = probe_http(cand[0], name, 443, TCP_TIMEOUT)
                 chosen = cand[0] if ms is not None else None
             else:
-                chosen, _ = probe_fastest(cand, timeout=TCP_TIMEOUT, host=name)
+                winners, _ = probe_fastest(cand, timeout=TCP_TIMEOUT, host=name)
+                chosen = winners[0][0] if winners else None
             if chosen:
                 with _cache_lock:
                     _cache[name] = {"ips": cand, "best": chosen,
