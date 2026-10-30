@@ -10,10 +10,15 @@
 
 | 域名类型 | 处理方式 |
 | --- | --- |
+| 命中优选 IP 池（`preferred_ips.json`）| 社区/已知优选节点 + 多源 DNS 候选合并，HTTP 实测挑最快（优先级最高）|
 | 已知 CDN（Cloudflare / Fastly / Akamai / 微软等）| 每 5 分钟实测 CDN 优选 IP 池，返回当前连接最快的节点（TTL 60）|
 | 未知但多 IP 的域名 | 首次解析时并发实测所有 IP 的连接速度，返回最快的一个（缓存 5 分钟）|
 | 单 IP / 其他记录类型 | 透明转发给原 DNS，不做手脚 |
 | CDN 域名的 AAAA 查询 | 返回空，强制走 IPv4 优选线路 |
+
+启动时会自动对常用游戏/社交/开发平台域名（Steam、GitHub、Discord、Twitch、Epic、EA、R星、暴雪、Xbox、PlayStation 等 40+）做预热优选，首次访问直接命中缓存。
+
+`preferred_ips.json` 是社区维护的优选候选池（GitHub 家族来自 GitHub520 项目，Steam 家族为已知 Akamai 节点），仅作为**候选**——每次连接前仍会 HTTP 级实测，过期的 IP 自动被滤掉，全死时自动降级到默认优选方案。
 
 所有"优选"都是 **HTTP 级实测**（TCP 连接 → TLS 握手 → 实际发送 HTTP 请求并收到响应码），不是只看 TCP 通或 TLS 通——"TLS 能握手但网页拉不动"的假阳性节点会被直接判死（Akamai/Cloudflare 等 anycast 在国内 ISP 线路上常见），并且：
 

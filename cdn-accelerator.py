@@ -26,6 +26,7 @@ import re
 import sys
 import time
 import ssl
+import json
 import socket
 import struct
 import threading
@@ -92,6 +93,43 @@ def is_cdn_ip(ip_str):
     except Exception:
         pass
     return False
+
+
+# ---------------------------------------------------------------------------
+# Preferred IP pools (community/known candidate lists). Used only as an extra
+# candidate pool - every candidate is still HTTP-probed live before use, so
+# stale IPs are filtered out automatically. Missing file = no preferred pool.
+# ---------------------------------------------------------------------------
+PREF_IPS = {}
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_PREF_FILE = os.path.join(_HERE, "preferred_ips.json")
+try:
+    with open(_PREF_FILE, "r", encoding="utf-8") as _f:
+        _raw = json.load(_f)
+    for _k, _v in _raw.items():
+        if isinstance(_v, list):
+            PREF_IPS[_k.lower()] = [str(i).strip() for i in _v if str(i).strip()]
+except Exception as _ex:
+    PREF_IPS = {}
+
+# Domains warmed up on startup (parse via multi-source DNS + probe, cache the
+# best). Includes the preferred-pool domains plus common gaming/social/dev
+# platforms whose IPs are gathered automatically at runtime.
+WARMUP_DOMAINS = [
+    "store.steampowered.com", "steamcommunity.com", "help.steampowered.com",
+    "api.steampowered.com", "steamcdn-a.akamaihd.net", "steampipe-a.akamaihd.net",
+    "github.com", "api.github.com", "raw.githubusercontent.com",
+    "assets-cdn.github.com", "github.global.ssl.fastly.net",
+    "avatars.githubusercontent.com", "codeload.github.com", "gist.github.com",
+    "discord.com", "discordapp.com", "twitch.tv", "epicgames.com",
+    "fortnite.com", "ea.com", "origin.com", "ubisoft.com", "uplay.com",
+    "rockstargames.com", "riotgames.com", "leagueoflegends.com",
+    "blizzard.com", "battle.net", "xbox.com", "playstation.com",
+    "nintendo.com", "minecraft.net", "minecraft.com",
+]
+for _k in PREF_IPS:
+    if _k not in WARMUP_DOMAINS:
+        WARMUP_DOMAINS.append(_k)
 
 
 # ---------------------------------------------------------------------------
@@ -524,6 +562,26 @@ def handle_query(data, addr):
             resp = forward_upstream(data)
             return rewrite_id(resp, q["id"]) if resp else servfail_response(q)
 
+        # Preferred-pool hit (community/known candidates): probe pref + multi-
+        # source results first. Falls through to the default logic when the
+        # whole preferred pool is dead.
+        pref = PREF_IPS.get(name)
+        if pref:
+            extra = resolve_multi_source(name, 1)
+            pool = list(ips)
+            for ip, _ in extra:
+                if ":" not in ip and ip not in pool:
+                    pool.append(ip)
+            cand = [p for p in pref if p not in pool] + pool
+            chosen, _ = probe_fastest(cand, timeout=TCP_TIMEOUT, host=name)
+            if chosen:
+                entry = {"ips": cand, "best": chosen, "updated": now, "cdn": True}
+                with _cache_lock:
+                    _cache[name] = entry
+                log.info("OPT  %s -> %s (pref, pool of %d)" % (name, chosen, len(cand)))
+                prune_cache()
+                return build_response(q, 0, [make_a_answer(q["qname_bytes"], chosen)])
+
         # CDN if any resolved IP sits in a known CDN range (single-IP counts
         # too - DNS load balancing often returns one edge that may be dead)
         cdn = any(is_cdn_ip(ip) for ip in ips[:6])
@@ -694,6 +752,40 @@ def health_worker():
             log.info("health error: %s" % ex)
 
 
+def warmup_worker():
+    """On start, resolve + probe the warm-up domain list so first visits hit
+    a pre-optimized answer instead of waiting for the first-lookup probe."""
+    def _warm(name):
+        try:
+            extra = resolve_multi_source(name, 1)
+            ips = [ip for ip, _ in extra if ":" not in ip]
+            if not ips:
+                return
+            pref = PREF_IPS.get(name) or []
+            cand = [p for p in pref if p not in ips] + ips
+            if len(cand) == 1:
+                ms = probe_http(cand[0], name, 443, TCP_TIMEOUT)
+                chosen = cand[0] if ms is not None else None
+            else:
+                chosen, _ = probe_fastest(cand, timeout=TCP_TIMEOUT, host=name)
+            if chosen:
+                with _cache_lock:
+                    _cache[name] = {"ips": cand, "best": chosen,
+                                    "updated": time.time(), "cdn": True}
+                log.info("WARM %s -> %s (pool %d)" % (name, chosen, len(cand)))
+        except Exception as _ex:
+            pass
+
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        futs = [ex.submit(_warm, d) for d in WARMUP_DOMAINS]
+        for f in futs:
+            try:
+                f.result()
+            except Exception:
+                pass
+    log.info("WARMUP domains done: %d" % len(WARMUP_DOMAINS))
+
+
 # ---------------------------------------------------------------------------
 # UDP server
 # ---------------------------------------------------------------------------
@@ -759,6 +851,7 @@ def main():
 
     threading.Thread(target=refresh_worker, daemon=True).start()
     threading.Thread(target=health_worker, daemon=True).start()
+    threading.Thread(target=warmup_worker, daemon=True).start()
 
     t4 = threading.Thread(target=serve, args=(s,), daemon=True)
     t4.start()
