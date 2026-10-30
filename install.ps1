@@ -52,7 +52,16 @@ $adapters = Get-DnsClientServerAddress -AddressFamily IPv4 -ErrorAction Silently
     Where-Object { $_.InterfaceIndex -in $realIdx -and $_.ServerAddresses.Count -gt 0 -and $_.ServerAddresses -notcontains '127.0.0.1' }
 $adapters6 = Get-DnsClientServerAddress -AddressFamily IPv6 -ErrorAction SilentlyContinue |
     Where-Object { $_.InterfaceIndex -in $realIdx -and $_.ServerAddresses.Count -gt 0 -and $_.ServerAddresses -notcontains '::1' }
-if ($adapters.Count -eq 0 -and $adapters6.Count -eq 0) { Write-Host "No upstream DNS found to change; nothing to do."; exit 0 }
+if ($adapters.Count -eq 0 -and $adapters6.Count -eq 0) {
+    # Either every real adapter already points at 127.0.0.1 (reinstall /
+    # already managed) or there is no DNS configured at all. A reinstall must
+    # still register the tasks and start the service; only a machine with no
+    # DNS anywhere is genuinely "nothing to do".
+    $anyDns = Get-DnsClientServerAddress -ErrorAction SilentlyContinue |
+        Where-Object { $_.ServerAddresses.Count -gt 0 } | Select-Object -First 1
+    if (-not $anyDns) { Write-Host "No network adapter with DNS; nothing to do."; exit 0 }
+    Write-Host "DNS already points at the local optimizer (reinstall); continuing."
+}
 if ($adapters.Count -gt 0) {
     $lines = @()
     foreach ($a in $adapters) { $lines += "$($a.InterfaceIndex)`t$($a.ServerAddresses -join ',')" }
@@ -86,18 +95,34 @@ Write-Host "System DNS -> 127.0.0.1 / ::1"
 #    -Lan adds the --lan flag (listen on 0.0.0.0/::) so phones on the same
 #    WiFi can use this machine's optimizer as their DNS.
 $orig = ($adapters | ForEach-Object { $_.ServerAddresses } | Where-Object { $_ -ne '127.0.0.1' -and $_ -notmatch ':' } | Select-Object -Unique | Select-Object -First 2)
-$upstreams = (@($orig) + @('223.5.5.5', '119.29.29.29')) | Select-Object -Unique | Select-Object -First 3 | Join-String -Separator ','
+# Join-String is PowerShell 7-only; the installer is right-click-run under
+# Windows PowerShell 5.1, so build the CSV manually.
+$upstreams = ((@($orig) + @('223.5.5.5', '119.29.29.29')) | Select-Object -Unique | Select-Object -First 3) -join ','
 if (-not $upstreams) { $upstreams = '223.5.5.5,119.29.29.29' }
-$lanFlag = ''
-if ($Lan) { $lanFlag = ' --lan' }
-& $schtasks /Create /TN "cdn_accelerator" /TR "`"$pywExe`" -u `"$script`" --upstream $upstreams$lanFlag" /SC ONLOGON /F | Out-Null
+$lanArg = ''
+if ($Lan) { $lanArg = ' --lan' }
+$lanArg2 = ''
+if ($Lan) { $lanArg2 = '--lan' }
+
+# Register-ScheduledTask instead of schtasks /TR: schtasks strips inner
+# quotes, so a path with spaces ("D:\Program Files\...") gets split and the
+# task silently fails while the script still prints "created". The
+# ScheduledTasks cmdlets take -Execute and -Argument separately - no
+# quote-mangling, works identically on Windows PowerShell 5.1 and pwsh 7.
+$user = ([System.Security.Principal.WindowsIdentity]::GetCurrent()).Name
+$principal = New-ScheduledTaskPrincipal -UserId $user -LogonType Interactive -RunLevel Highest
+
+# 4. on-logon task: the optimizer itself
+$act = New-ScheduledTaskAction -Execute $pywExe -Argument ('-u "' + $script + '" --upstream ' + $upstreams + $lanArg)
+Register-ScheduledTask -TaskName "cdn_accelerator" -Action $act -Trigger (New-ScheduledTaskTrigger -AtLogOn) -Principal $principal -Force | Out-Null
 Write-Host "Scheduled task created (on logon), upstream=$upstreams$(if ($Lan) { ', LAN shared' })"
 
 # 4a. watchdog: relaunches the optimizer within ~20s if it ever dies.
 #     Without it, a crash leaves system DNS pointing at a dead 127.0.0.1
 #     (cached pages open, new lookups fail - "bilibili opens, images don't").
 $watch = Join-Path $dir 'watch.py'
-& $schtasks /Create /TN "cdn_accelerator_watch" /TR "`"$pywExe`" `"$watch`" --upstream $upstreams$lanFlag" /SC ONLOGON /F | Out-Null
+$actW = New-ScheduledTaskAction -Execute $pywExe -Argument ('"' + $watch + '" --upstream ' + $upstreams + $lanArg)
+Register-ScheduledTask -TaskName "cdn_accelerator_watch" -Action $actW -Trigger (New-ScheduledTaskTrigger -AtLogOn) -Principal $principal -Force | Out-Null
 Write-Host "Watchdog scheduled task created (auto-restart if the optimizer dies)"
 
 # 4b. periodic keeper: every 5 minutes, owned by Task Scheduler so no app
@@ -105,7 +130,9 @@ Write-Host "Watchdog scheduled task created (auto-restart if the optimizer dies)
 #     exit) can kill the recovery path. check.py relaunches optimizer AND
 #     watchdog if both died. Pure bundled python - no powershell.exe/wmic.
 $check = Join-Path $dir 'check.py'
-& $schtasks /Create /TN "cdn_accelerator_check" /TR "`"$pywExe`" `"$check`"" /SC MINUTE /MO 5 /F | Out-Null
+$actC = New-ScheduledTaskAction -Execute $pywExe -Argument ('"' + $check + '"')
+$trgC = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) -RepetitionInterval (New-TimeSpan -Minutes 5)
+Register-ScheduledTask -TaskName "cdn_accelerator_check" -Action $actC -Trigger $trgC -Principal $principal -Force | Out-Null
 Write-Host "Periodic keeper task created (every 5 min, scheduler-owned self-heal)"
 
 # 4c. LAN mode: allow inbound UDP 53 so phones/devices can query this machine
